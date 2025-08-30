@@ -1,0 +1,124 @@
+-- Copyright (c) 2025, Thetanuts Asset Corp. All rights reserved.
+-- SPDX-License-Identifier: 0BSD
+
+-- Covered call vault contract
+module Options.CoveredCallVault where
+
+import Splice.Util
+
+data VaultStatus = Live | Locked | Closed | Ready
+  deriving (Eq, Show)
+
+data VaultParams = VaultParams
+  deriving (Eq, Show)
+
+data VaultGroup = VaultGroup
+  with
+    provider : Party
+    dso: Party
+  deriving (Show, Eq)
+
+template CoveredCallVault with
+    provider : Party
+    dso : Party
+    vaultId : Text
+    name : Text
+    strike : Decimal
+    size : Decimal
+    asset : Text
+    underlying : Text
+    lpPrice : Decimal
+    premiumAmount : Decimal
+    epoch : Int
+    expiresAt : Time
+    status : VaultStatus
+    params : VaultParams
+    epochMm : Optional Party  -- Designated MM party for the current epoch
+  where
+    signatory provider
+    observer dso
+    
+    choice CoveredCallVault_UpdateName : ContractId CoveredCallVault
+      with
+        newName : Text
+      controller provider
+      do
+        create this with name = newName
+
+    choice CoveredCallVault_LockVault : ContractId CoveredCallVault
+      controller provider
+      do
+        create this with status = Locked
+
+    choice CoveredCallVault_SetupEpoch : (ContractId CoveredCallVault, ContractId EpochInitializationRequest)
+      with
+        newStrike : Decimal
+        newPremiumAmount : Decimal
+        newMm : Party
+        newExpiresAt : Time
+      controller provider
+      do
+        -- Ensure vault is locked before setting up epoch
+        require "Vault must be locked before setting up epoch" (this.status == Locked)
+        
+        -- Update the vault with epoch MM and set status to Ready (expiry will be set when epoch is accepted)
+        updatedVault <- create this with 
+          epochMm = Some newMm
+          status = Ready
+        
+        request <- create EpochInitializationRequest with
+          provider = this.provider
+          mm = newMm
+          dso = this.dso
+          vaultId = updatedVault
+          newStrike = newStrike
+          newPremiumAmount = newPremiumAmount
+          expiresAt = newExpiresAt
+        
+        pure (updatedVault, request)
+    choice CoveredCallVault_Archive : ()
+      with
+      controller provider
+      do
+        pure ()
+
+
+
+instance HasCheckedFetch CoveredCallVault VaultGroup where
+  contractGroupId CoveredCallVault{..} = VaultGroup with ..
+
+-- | A request to initialize an epoch by the designated MM party
+template EpochInitializationRequest with
+    provider : Party -- ^ Provider who set up the epoch
+    mm : Party -- ^ Designated MM party who can initialize the epoch
+    dso : Party -- ^ DSO party
+    vaultId : ContractId CoveredCallVault -- ^ Reference to the vault
+    newStrike : Decimal -- ^ New strike price for the epoch
+    newPremiumAmount : Decimal -- ^ Amount the MM must pay
+    expiresAt : Time -- ^ When this request expires
+  where
+    signatory provider
+    observer mm -- Only the designated MM can see and accept this request
+    
+    choice EpochInitializationRequest_Accept : ContractId CoveredCallVault
+      controller mm, provider -- Both MM and provider can accept (provider as backup)
+      do
+        vault <- fetchAndArchive VaultGroup {provider, dso} vaultId
+        
+        let newSize = vault.size + newPremiumAmount
+        let newLpPrice = if vault.size == 0.0 
+                         then 1.0  -- Default LP price for first epoch
+                         else vault.lpPrice * newSize / vault.size
+        
+        create vault with
+          strike = newStrike
+          premiumAmount = newPremiumAmount
+          epoch = vault.epoch + 1
+          size = newSize
+          lpPrice = newLpPrice
+          epochMm = None -- Clear the epoch MM after initialization
+          status = Live -- Set status to Live once epoch is initialized
+          expiresAt = expiresAt
+
+        -- TODO: MM party pays premium amount (must happen before state updates)
+        -- TRANSFER: mm pays premiumAmount to vault
