@@ -1,0 +1,14 @@
+# for config file options, refer to
+# https://docs.daml.com/tools/assistant.html#project-config-file-daml-yaml
+
+sdk-version: 3.3.0-snapshot.20250502.13767.0.v2fc6c7e2
+name: theta-options-devnet
+source: daml
+version: 0.0.1
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+- ../dars/splice-amulet-current.dar
+- ../dars/splice-util-current.dar
+- ../dars/splice-wallet-payments-current.dar

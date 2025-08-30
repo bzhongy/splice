@@ -1,0 +1,12 @@
+module Options.TestRunner where
+
+import Daml.Script
+import Options.TestCoveredCallVault
+import Options.TestBilateral
+
+main : Script ()
+main = do
+  testCoveredCallVault
+  testVaultWorkflow
+  runAllBilateralTests
+  pure ()
