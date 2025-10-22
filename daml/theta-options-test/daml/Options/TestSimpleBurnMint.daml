@@ -1,0 +1,71 @@
+module Options.TestSimpleBurnMint where
+
+import Daml.Script
+import DA.Time
+
+import Options.SimpleBurnMintV2
+
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.BurnMintV1 qualified as BM
+import Splice.Testing.Utils (emptyExtraArgs)
+
+
+testMintToVault_MustFailWithoutFactory : Script ()
+testMintToVault_MustFailWithoutFactory = script do
+  appProvider <- allocateParty "appProvider"
+  vaultParty <- allocateParty "vault"
+
+  let newInstrumentId = HoldingV1.InstrumentId { admin = appProvider, id = "AppToken" }
+
+  sbmCid <- submitMulti [vaultParty, appProvider] [] do
+    createCmd SimpleBurnMintV2 with
+      appProvider
+      vaultParty
+      instrumentId = newInstrumentId
+
+  let fakeFactoryCid : ContractId BM.BurnMintFactory
+      fakeFactoryCid = coerceContractId sbmCid
+
+  submitMustFail appProvider do
+    exerciseCmd sbmCid (SimpleBurnMint_Request with
+      factoryCid = fakeFactoryCid
+      expectedAdmin = appProvider
+      inputHoldingCids = []
+      output = BM.BurnMintOutput with owner = vaultParty, amount = 10.0, context = emptyChoiceContext
+      extraActors = [vaultParty]
+      extraArgs = emptyExtraArgs)
+
+  pure ()
+
+
+testBurnAndMintToVault_MustFailWithoutFactory : Script ()
+testBurnAndMintToVault_MustFailWithoutFactory = script do
+  appProvider <- allocateParty "appProvider"
+  vaultParty <- allocateParty "vault"
+  alice <- allocateParty "alice"
+
+  let newInstrumentId = HoldingV1.InstrumentId { admin = appProvider, id = "AppToken" }
+
+  sbmCid <- submitMulti [vaultParty, appProvider] [] do
+    createCmd SimpleBurnMintV2 with
+      appProvider
+      vaultParty
+      instrumentId = newInstrumentId
+
+  let fakeFactoryCid : ContractId BM.BurnMintFactory
+      fakeFactoryCid = coerceContractId sbmCid
+
+  submitMustFail appProvider do
+    exerciseCmd sbmCid (SimpleBurnMint_Request with
+      factoryCid = fakeFactoryCid
+      expectedAdmin = appProvider
+      inputHoldingCids = []
+      output = BM.BurnMintOutput with owner = vaultParty, amount = 5.0, context = emptyChoiceContext
+      extraActors = [alice, vaultParty]
+      extraArgs = emptyExtraArgs)
+
+  pure ()
+
+
+
