@@ -27,7 +27,7 @@ interface BurnMintFactory where
     -- including failing on all inputs or not implementing this interface at all.
     with
       expectedAdmin : Party
-       -- ^ The expected `admin` party issuing the factory. Implementations MUST validate that this matches
+        -- ^ The expected `admin` party issuing the factory. Implementations MUST validate that this matches
         -- the admin of the factory.
         -- Callers should ensure they get `expectedAdmin` from a trusted source, e.g., a read against
         -- their own participant. That way they can ensure that it is safe to exercise a choice

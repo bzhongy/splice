@@ -1,0 +1,71 @@
+module Options.TestSimpleAmuletAllocation where
+
+import Daml.Script
+import DA.Assert
+import DA.Time
+import DA.List (head)
+
+import Options.SimpleAmuletAllocation
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+-- import Splice.Api.Token.AllocationRequestV1
+import Splice.Api.Token.AllocationV1 as Api.Token.AllocationV1
+import Splice.Api.Token.AllocationInstructionV1
+
+import Splice.Testing.TokenStandard.RegistryApi qualified as RegistryApi
+import Splice.Testing.TokenStandard.WalletClient qualified as WalletClient
+import Splice.Testing.Registries.AmuletRegistry qualified as AmuletRegistry
+import Splice.Testing.Utils
+
+testSimpleAmuletAllocation : Script ()
+testSimpleAmuletAllocation = script do
+  registry <- AmuletRegistry.initialize AmuletRegistry.defaultAmuletRegistryConfig
+  let exec = registry.dso
+  alice <- allocateParty "alice"
+  vault <- allocateParty "vault"
+  AmuletRegistry.featureApp registry vault
+  AmuletRegistry.tapLockedAndUnlockedFunds registry alice 2.0
+
+  now <- getTime
+
+  reqCid <- submitMulti [alice, vault] [] do
+    createCmd SimpleAmuletAllocation with
+      requestId = "req-1"
+      executor = vault
+      sender = alice
+      receiver = vault
+      amount = 1.0
+      instrumentId = InstrumentId with id = "Amulet", admin = exec
+      requestedAt = now
+      allocateBefore = now `addRelTime` hours 1
+      settleBefore = now `addRelTime` days 1
+      description = "deposit"
+
+  [userAlloc] <- WalletClient.listRequestedAllocations alice (InstrumentId with id = "Amulet", admin = exec)
+  userHoldingCids <- WalletClient.listHoldingCids alice (InstrumentId with id = "Amulet", admin = exec)
+  enrichedChoice <- RegistryApi.getAllocationFactory registry AllocationFactory_Allocate with
+    expectedAdmin = exec
+    allocation = userAlloc
+    requestedAt = now
+    inputHoldingCids = userHoldingCids
+    extraArgs = emptyExtraArgs
+  submitWithDisclosures' alice enrichedChoice.disclosures $ exerciseCmd enrichedChoice.factoryCid enrichedChoice.arg
+
+  allocs <- queryInterface @Allocation exec
+  let matching = [ (cid, v) | (cid, Some v) <- allocs, v.allocation.settlement.settlementRef.id == "req-1" ]
+  let (allocCid, _) = head matching
+
+  context <- RegistryApi.getAllocation_TransferContext registry allocCid emptyMetadata
+  submitWithDisclosures' vault context.disclosures $
+    exerciseCmd reqCid (SimpleAmuletAllocation_Execute with
+      allocationCid = allocCid
+      extraArgs = ExtraArgs with
+        context = context.choiceContext
+        meta = emptyMetadata)
+
+  mReq <- queryContractId exec reqCid
+  assertEq None mReq
+  pure ()
+
+

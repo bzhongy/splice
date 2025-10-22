@@ -1,0 +1,64 @@
+module Options.TestSimpleAmuletTransfer where
+
+import Daml.Script
+import DA.Time
+
+import Options.SimpleAmuletTransferV2
+
+import Splice.Api.Token.MetadataV1
+import DA.TextMap qualified as TextMap
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.TransferInstructionV1 qualified as TI
+import Splice.Testing.Registries.AmuletRegistry qualified as AmuletRegistry
+import Splice.Testing.TokenStandard.RegistryApi qualified as RegistryApi
+import Splice.Testing.Utils (emptyExtraArgs, submitWithDisclosures', queryDisclosure')
+
+testSimpleAmuletTransfer : Script ()
+testSimpleAmuletTransfer = script do
+  registry <- AmuletRegistry.initialize AmuletRegistry.defaultAmuletRegistryConfig
+
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+
+  holdingCid <- AmuletRegistry.tapFaucet registry alice 100.0
+
+  now <- getTime
+
+  stCid <- submit alice do
+    createCmd SimpleAmuletTransferV2 with
+      sender = alice
+      receiver = bob
+      instrumentId = HoldingV1.InstrumentId { admin = registry.dso, id = "Amulet" }
+  
+  let transfer = TI.Transfer with
+        sender = alice
+        receiver = bob
+        amount = 1.0
+        instrumentId = HoldingV1.InstrumentId { admin = registry.dso, id = "Amulet" }
+        requestedAt = now
+        executeBefore = now `addRelTime` days 1
+        inputHoldingCids = [holdingCid]
+        meta = Metadata with values = TextMap.fromList [("splice.lfdecentralizedtrust.org/reason", "test-transfer")]
+
+  enrichedChoice <- RegistryApi.getTransferFactory registry TI.TransferFactory_Transfer with
+    expectedAdmin = registry.dso
+    transfer
+    extraArgs = emptyExtraArgs
+
+  let factoryCid = enrichedChoice.factoryCid
+
+  stDisc <- queryDisclosure' @SimpleAmuletTransferV2 alice stCid
+  let discs = enrichedChoice.disclosures <> stDisc
+
+  res <- submitWithDisclosures' alice discs do
+    exerciseCmd stCid (SimpleAmuletTransfer_Run with
+      factoryCid
+      expectedAdmin = registry.dso
+      transfer
+      extraArgs = enrichedChoice.arg.extraArgs)
+
+  TI.TransferInstructionResult_Pending _ <- pure res.output
+
+  pure ()
+
+

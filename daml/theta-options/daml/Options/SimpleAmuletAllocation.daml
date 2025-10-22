@@ -1,0 +1,68 @@
+module Options.SimpleAmuletAllocation where
+
+import qualified DA.TextMap as TextMap
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.AllocationRequestV1
+import Splice.Api.Token.AllocationV1 as Api.Token.AllocationV1
+
+template SimpleAmuletAllocation
+  with
+    requestId : Text
+    executor : Party
+    sender : Party
+    receiver : Party
+    amount : Decimal
+    instrumentId : InstrumentId
+    requestedAt : Time
+    allocateBefore : Time
+    settleBefore : Time
+    description : Text
+  where
+    signatory sender, executor
+
+    postconsuming choice SimpleAmuletAllocation_Execute : ()
+      with
+        allocationCid : ContractId Allocation
+        extraArgs : ExtraArgs
+      controller executor
+      do
+        exercise allocationCid (Allocation_ExecuteTransfer extraArgs)
+        pure ()
+
+    interface instance AllocationRequest for SimpleAmuletAllocation where
+      view =
+        AllocationRequestView
+          with
+            settlement =
+              SettlementInfo
+                with
+                  executor = executor
+                  requestedAt
+                  allocateBefore
+                  settleBefore
+                  settlementRef =
+                    Reference
+                      with
+                        id = requestId
+                        cid = None
+                  meta = emptyMetadata
+            transferLegs = TextMap.fromList
+              [("deposit", Api.Token.AllocationV1.TransferLeg
+                  with
+                    sender = sender
+                    receiver = receiver
+                    amount = amount
+                    instrumentId = instrumentId
+                    meta = emptyMetadata)
+              ]
+            meta = emptyMetadata
+
+      allocationRequest_RejectImpl _ _ =
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+      allocationRequest_WithdrawImpl _ _ =
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+

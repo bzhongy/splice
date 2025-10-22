@@ -1,0 +1,52 @@
+module Options.SimpleBurnMint where
+
+import qualified DA.TextMap as TextMap
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.BurnMintV1
+
+
+template SimpleBurnMint
+  with
+    appProvider : Party
+    vaultParty : Party
+    vaultInstrumentId : InstrumentId
+  where
+    signatory vaultParty, appProvider
+
+    choice SimpleBurnMint_MintToVault : BurnMintFactory_BurnMintResult
+      with
+        factoryCid : ContractId BurnMintFactory
+        expectedAdmin : Party
+        amount : Decimal
+        extraActors : [Party]
+        extraArgs : ExtraArgs
+      controller appProvider
+      do
+        exercise factoryCid BurnMintFactory_BurnMint with
+          expectedAdmin = expectedAdmin
+          instrumentId = vaultInstrumentId
+          inputHoldingCids = []
+          outputs = [BurnMintOutput with owner = vaultParty, amount = amount, context = emptyChoiceContext]
+          extraActors
+          extraArgs = extraArgs
+
+    choice SimpleBurnMint_BurnAndMintToVault : BurnMintFactory_BurnMintResult
+      with
+        factoryCid : ContractId BurnMintFactory
+        expectedAdmin : Party
+        inputHoldingCids : [ContractId Holding]
+        amount : Decimal
+        extraActors : [Party]
+        extraArgs : ExtraArgs
+      controller appProvider
+      do
+        exercise factoryCid BurnMintFactory_BurnMint with
+          expectedAdmin = expectedAdmin
+          instrumentId = vaultInstrumentId
+          inputHoldingCids
+          outputs = [BurnMintOutput with owner = vaultParty, amount = amount, context = emptyChoiceContext]
+          extraActors
+          extraArgs = extraArgs
+

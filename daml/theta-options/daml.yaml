@@ -2,13 +2,19 @@
 # https://docs.daml.com/tools/assistant.html#project-config-file-daml-yaml
 
 sdk-version: 3.3.0-snapshot.20250502.13767.0.v2fc6c7e2
-name: theta-options-devnet
+name: theta-options-development-version
 source: daml
-version: 0.0.1
+version: 0.0.4
 dependencies:
   - daml-prim
   - daml-stdlib
 data-dependencies:
-- ../dars/splice-amulet-current.dar
-- ../dars/splice-util-current.dar
-- ../dars/splice-wallet-payments-current.dar
+- ../dars/splice-amulet-0.1.14.dar
+- ../dars/splice-util-0.1.4.dar
+- ../dars/splice-wallet-payments-0.1.14.dar
+- ../dars/splice-api-token-metadata-v1-1.0.0.dar
+- ../dars/splice-api-token-holding-v1-1.0.0.dar
+- ../dars/splice-api-token-transfer-instruction-v1-1.0.0.dar
+- ../dars/splice-api-token-allocation-request-v1-1.0.0.dar
+- ../dars/splice-api-token-allocation-v1-1.0.0.dar
+- ../dars/splice-api-token-burn-mint-v1-1.0.0.dar
