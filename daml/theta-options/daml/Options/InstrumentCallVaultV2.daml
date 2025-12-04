@@ -1,0 +1,499 @@
+module Options.InstrumentCallVaultV2 where
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.TransferInstructionV1
+import Splice.Api.FeaturedAppRightV1
+
+
+data VaultStatus = Active | Locked | Settled
+  deriving (Eq, Show)
+
+
+
+template InstrumentCallVault
+  with
+    appProvider : Party
+    instrumentId : InstrumentId
+    name : Text
+  where
+    signatory appProvider
+
+    nonconsuming choice InstrumentCallVault_Initialize : ContractId InstrumentCallVaultConfig
+      with
+        expiryDate : Time
+        epochDays : Decimal
+      controller appProvider
+      do
+        create InstrumentCallVaultConfig with
+          appProvider
+          vaultCid = self
+          lpValue = 1.0
+          strike = 0.0
+          epoch = 0
+          totalSupply = 0.0
+          status = Settled
+          buyer = appProvider
+          premium = 0.0
+          pendingTotalSupply = 0.0
+          settledPrice = 0.0
+          expiryDate
+          epochDays
+
+    nonconsuming choice InstrumentCallVault_Deposit : TransferInstructionResult
+      with
+        factoryCid : ContractId TransferFactory
+        expectedAdmin : Party
+        user : Party
+        transfer : Transfer
+        extraArgs : ExtraArgs
+        configCid : ContractId InstrumentCallVaultConfig
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+      controller user
+      do
+        assertMsg "transfer.sender must equal user" (transfer.sender == user)
+        assertMsg "transfer.receiver must equal appProvider" (transfer.receiver == appProvider)
+        assertMsg "transfer.instrumentId must equal vault instrumentId" (transfer.instrumentId == instrumentId)
+        assertMsg "transfer.meta must not be empty" (transfer.meta /= emptyMetadata)
+        config <- fetch configCid
+        assertMsg "config.vaultCid must equal vault" (config.vaultCid == self)
+        assertMsg "vault must not be Locked to deposit" (config.status /= Locked)
+        res <- exercise factoryCid TransferFactory_Transfer with
+          expectedAdmin = expectedAdmin
+          transfer = transfer
+          extraArgs = extraArgs
+        let lpAmount = transfer.amount / config.lpValue
+        _ <- create InstrumentCallPosition with
+          user = user
+          appProvider = appProvider
+          instrumentId = instrumentId
+          vaultCid = self
+          lpAmount = lpAmount
+          lpValue = config.lpValue
+        case featuredAppRightCid of
+          Some rightCid -> do
+            _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
+            pure ()
+          None -> pure ()
+        pure res
+
+    nonconsuming choice InstrumentCallVault_TopUp : TransferInstructionResult
+      with
+        factoryCid : ContractId TransferFactory
+        expectedAdmin : Party
+        user : Party
+        transfer : Transfer
+        extraArgs : ExtraArgs
+        existingPositionCid : ContractId InstrumentCallPosition
+        configCid : ContractId InstrumentCallVaultConfig
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+      controller user
+      do
+        assertMsg "transfer.sender must equal user" (transfer.sender == user)
+        assertMsg "transfer.receiver must equal appProvider" (transfer.receiver == appProvider)
+        assertMsg "transfer.instrumentId must equal vault instrumentId" (transfer.instrumentId == instrumentId)
+        assertMsg "transfer.meta must not be empty" (transfer.meta /= emptyMetadata)
+        config <- fetch configCid
+        assertMsg "config.vaultCid must equal vault" (config.vaultCid == self)
+        assertMsg "vault must not be Locked to top up" (config.status /= Locked)
+        res <- exercise factoryCid TransferFactory_Transfer with
+          expectedAdmin = expectedAdmin
+          transfer = transfer
+          extraArgs = extraArgs
+        existingPosition <- fetch existingPositionCid
+        assertMsg "existingPosition.user must equal user" (existingPosition.user == user)
+        assertMsg "existingPosition.appProvider must equal appProvider" (existingPosition.appProvider == appProvider)
+        assertMsg "existingPosition.vaultCid must equal vault" (existingPosition.vaultCid == self)
+        archive existingPositionCid
+        let newLpAmount = transfer.amount / config.lpValue
+        let combinedLpAmount = existingPosition.lpAmount + newLpAmount
+        let oldValue = existingPosition.lpAmount * existingPosition.lpValue
+        let newValue = newLpAmount * config.lpValue
+        let averagedLpValue = (oldValue + newValue) / combinedLpAmount
+        _ <- create InstrumentCallPosition with
+          user = user
+          appProvider = appProvider
+          instrumentId = instrumentId
+          vaultCid = self
+          lpAmount = combinedLpAmount
+          lpValue = averagedLpValue
+        case featuredAppRightCid of
+          Some rightCid -> do
+            _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
+            pure ()
+          None -> pure ()
+        pure res
+
+    nonconsuming choice InstrumentCallVault_SendReward : TransferInstructionResult
+      with
+        factoryCid : ContractId TransferFactory
+        expectedAdmin : Party
+        transfer : Transfer
+        extraArgs : ExtraArgs
+        featuredAppRightCid : ContractId FeaturedAppRight
+        beneficiaries : [AppRewardBeneficiary]
+      controller appProvider
+      do
+        assertMsg "transfer.sender must equal appProvider" (transfer.sender == appProvider)
+        res <- exercise factoryCid TransferFactory_Transfer with
+          expectedAdmin = expectedAdmin
+          transfer = transfer
+          extraArgs = extraArgs
+        _ <- exercise featuredAppRightCid FeaturedAppRight_CreateActivityMarker with
+          beneficiaries = beneficiaries
+        pure res
+
+    nonconsuming choice InstrumentCallVault_MarginCheck : TransferInstructionResult
+      with
+        factoryCid : ContractId TransferFactory
+        expectedAdmin : Party
+        transfer : Transfer
+        extraArgs : ExtraArgs
+        featuredAppRightCid : ContractId FeaturedAppRight
+        beneficiaries : [AppRewardBeneficiary]
+      controller appProvider
+      do
+        assertMsg "transfer.sender must equal appProvider" (transfer.sender == appProvider)
+        res <- exercise factoryCid TransferFactory_Transfer with
+          expectedAdmin = expectedAdmin
+          transfer = transfer
+          extraArgs = extraArgs
+        _ <- exercise featuredAppRightCid FeaturedAppRight_CreateActivityMarker with
+          beneficiaries = beneficiaries
+        pure res
+
+
+    nonconsuming choice InstrumentCallVault_RequestWithdraw : ContractId WithdrawRequest
+      with
+        user : Party
+        positionCid : ContractId InstrumentCallPosition
+        lpAmount : Decimal
+        configCid : ContractId InstrumentCallVaultConfig
+      controller user
+      do
+        config <- fetch configCid
+        assertMsg "config.vaultCid must equal vault" (config.vaultCid == self)
+        assertMsg "vault must not be Locked to request withdraw" (config.status /= Locked)
+        position <- fetch positionCid
+        assertMsg "position.user must equal user" (position.user == user)
+        assertMsg "position.appProvider must equal appProvider" (position.appProvider == appProvider)
+        assertMsg "lpAmount must not exceed position lpAmount" (lpAmount <= position.lpAmount)
+        create WithdrawRequest with
+          appProvider
+          instrumentId
+          user
+          lpAmount
+          positionCid
+          vaultCid = self
+
+    nonconsuming choice InstrumentCallVault_RequestWithdrawByProvider : ContractId WithdrawRequest
+      with
+        user : Party
+        positionCid : ContractId InstrumentCallPosition
+        lpAmount : Decimal
+        configCid : ContractId InstrumentCallVaultConfig
+      controller appProvider
+      do
+        config <- fetch configCid
+        assertMsg "config.vaultCid must equal vault" (config.vaultCid == self)
+        assertMsg "vault must not be Locked to request withdraw" (config.status /= Locked)
+        position <- fetch positionCid
+        assertMsg "position.user must equal user" (position.user == user)
+        assertMsg "position.appProvider must equal appProvider" (position.appProvider == appProvider)
+        assertMsg "lpAmount must not exceed position lpAmount" (lpAmount <= position.lpAmount)
+        create WithdrawRequest with
+          appProvider
+          instrumentId
+          user
+          lpAmount
+          positionCid
+          vaultCid = self
+
+    nonconsuming choice InstrumentCallVault_Lock : ContractId InstrumentCallVaultConfig
+      with
+        configCid : ContractId InstrumentCallVaultConfig
+        newTotalSupply : Decimal
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+      controller appProvider
+      do
+        config <- fetch configCid
+        assertMsg "config.vaultCid must equal vault" (config.vaultCid == self)
+        assertMsg "config.status must be Settled" (config.status == Settled)
+        archive configCid
+        newConfigCid <- create config with
+          status = Locked
+          pendingTotalSupply = newTotalSupply * config.lpValue
+        case featuredAppRightCid of
+          Some rightCid -> do
+            _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
+            pure newConfigCid
+          None -> pure newConfigCid
+
+    nonconsuming choice InstrumentCallVault_RequestPremium : ContractId InstrumentCallVaultConfig
+      with
+        configCid : ContractId InstrumentCallVaultConfig
+        buyerParty : Party
+        premium : Decimal
+        newStrike : Decimal
+        newEpochDays : Decimal
+        newExpiryDate : Time
+      controller appProvider
+      do
+        config <- fetch configCid
+        assertMsg "config.vaultCid must equal vault" (config.vaultCid == self)
+        assertMsg "config.status must be Locked" (config.status == Locked)
+        archive configCid
+        create config with
+          buyer = buyerParty
+          premium = premium
+          strike = newStrike
+          epochDays = newEpochDays
+          expiryDate = newExpiryDate
+
+    nonconsuming choice InstrumentCallVault_SettleEpoch : ContractId InstrumentCallVaultConfig
+      with
+        configCid : ContractId InstrumentCallVaultConfig
+        settledPrice : Decimal
+        epochEndTotalSupply : Decimal
+        newExpiryDate : Time
+        settlementTransfer : Optional Transfer
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+        factoryCid : Optional (ContractId TransferFactory)
+        expectedAdmin : Optional Party
+        extraArgs : Optional ExtraArgs
+      controller appProvider
+      do
+        config <- fetch configCid
+        assertMsg "config.vaultCid must equal vault" (config.vaultCid == self)
+        assertMsg "config.status must be Active" (config.status == Active)
+        let currentEpochAmount = epochEndTotalSupply * config.lpValue
+        let settlementLoss = if settledPrice > config.strike
+              then currentEpochAmount * (settledPrice - config.strike) / settledPrice
+              else 0.0
+        let newLpValue = (currentEpochAmount - settlementLoss) / epochEndTotalSupply
+        if settlementLoss > 0.0
+          then do
+            case (settlementTransfer, factoryCid, expectedAdmin, extraArgs) of
+              (Some transfer, Some factory, Some admin, Some args) -> do
+                assertMsg "transfer.sender must equal appProvider" (transfer.sender == appProvider)
+                assertMsg "transfer.receiver must equal buyer" (transfer.receiver == config.buyer)
+                assertMsg "transfer.amount must equal settlementLoss" (transfer.amount == settlementLoss)
+                _ <- exercise factory TransferFactory_Transfer with
+                  expectedAdmin = admin
+                  transfer = transfer
+                  extraArgs = args
+                pure ()
+              _ -> abort "settlementTransfer, factoryCid, expectedAdmin, and extraArgs are required when settlementLoss > 0"
+          else pure ()
+        archive configCid
+        newConfigCid <- create config with
+          status = Settled
+          lpValue = newLpValue
+          settledPrice = settledPrice
+          expiryDate = newExpiryDate
+          buyer = appProvider
+        case featuredAppRightCid of
+          Some rightCid -> do
+            _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
+            pure newConfigCid
+          None -> pure newConfigCid
+
+
+template InstrumentCallVaultConfig
+  with
+    appProvider : Party
+    vaultCid : ContractId InstrumentCallVault
+    lpValue : Decimal
+    strike : Decimal
+    epoch : Int
+    totalSupply : Decimal
+    status : VaultStatus
+    buyer : Party
+    premium : Decimal
+    pendingTotalSupply : Decimal
+    settledPrice : Decimal
+    expiryDate : Time
+    epochDays : Decimal
+  where
+    signatory appProvider
+    observer buyer
+
+    choice InstrumentCallVaultConfig_UpdateEpochDays : ContractId InstrumentCallVaultConfig
+      with
+        newEpochDays : Decimal
+      controller appProvider
+      do
+        archive self
+        create this with epochDays = newEpochDays
+
+    choice InstrumentCallVaultConfig_StartEpoch : (ContractId InstrumentCallVaultConfig, TransferInstructionResult)
+      with
+        factoryCid : ContractId TransferFactory
+        expectedAdmin : Party
+        transfer : Transfer
+        extraArgs : ExtraArgs
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+      controller buyer
+      do
+        assertMsg "status must be Locked" (status == Locked)
+        assertMsg "transfer.sender must equal buyer" (transfer.sender == buyer)
+        assertMsg "transfer.receiver must equal appProvider" (transfer.receiver == appProvider)
+        assertMsg "transfer.amount must equal premium" (transfer.amount == premium)
+        res <- exercise factoryCid TransferFactory_Transfer with
+          expectedAdmin = expectedAdmin
+          transfer = transfer
+          extraArgs = extraArgs
+        let newLpValue = lpValue * (pendingTotalSupply + premium) / pendingTotalSupply
+        newConfig <- create this with
+          epoch = epoch + 1
+          totalSupply = pendingTotalSupply + premium
+          status = Active
+          lpValue = newLpValue
+        case featuredAppRightCid of
+          Some rightCid -> do
+            _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
+            pure ()
+          None -> pure ()
+        pure (newConfig, res)
+
+
+template WithdrawRequest
+  with
+    appProvider : Party
+    instrumentId : InstrumentId
+    user : Party
+    lpAmount : Decimal
+    positionCid : ContractId InstrumentCallPosition
+    vaultCid : ContractId InstrumentCallVault
+  where
+    signatory user
+    observer appProvider
+
+    choice WithdrawRequest_Accept : TransferInstructionResult
+      with
+        factoryCid : ContractId TransferFactory
+        expectedAdmin : Party
+        transfer : Transfer
+        extraArgs : ExtraArgs
+        configCid : ContractId InstrumentCallVaultConfig
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+      controller appProvider
+      do
+        config <- fetch configCid
+        assertMsg "config.vaultCid must equal vault" (config.vaultCid == vaultCid)
+        assertMsg "config.status must be Settled" (config.status == Settled)
+        position <- fetch positionCid
+        assertMsg "position.user must equal user" (position.user == user)
+        assertMsg "position.appProvider must equal appProvider" (position.appProvider == appProvider)
+        assertMsg "transfer.sender must equal appProvider" (transfer.sender == appProvider)
+        assertMsg "transfer.receiver must equal user" (transfer.receiver == user)
+        assertMsg "transfer.instrumentId must equal position instrumentId" (transfer.instrumentId == position.instrumentId)
+        assertMsg "lpAmount must not exceed position lpAmount" (lpAmount <= position.lpAmount)
+        let withdrawAmount = lpAmount * config.lpValue
+        assertMsg "withdrawAmount must equal transfer.amount" (withdrawAmount == transfer.amount)
+        res <- exercise factoryCid TransferFactory_Transfer with
+          expectedAdmin = expectedAdmin
+          transfer = transfer
+          extraArgs = extraArgs
+        archive positionCid
+        let remainingLpAmount = position.lpAmount - lpAmount
+        case featuredAppRightCid of
+          Some rightCid -> do
+            _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
+            pure ()
+          None -> pure ()
+        if remainingLpAmount > 0.0
+          then do
+            _ <- create InstrumentCallPosition with
+              user = user
+              appProvider = appProvider
+              instrumentId = position.instrumentId
+              vaultCid = vaultCid
+              lpAmount = remainingLpAmount
+              lpValue = position.lpValue
+            pure res
+          else pure res
+
+    choice WithdrawRequest_AcceptByUser : TransferInstructionResult
+      with
+        factoryCid : ContractId TransferFactory
+        expectedAdmin : Party
+        transfer : Transfer
+        extraArgs : ExtraArgs
+        configCid : ContractId InstrumentCallVaultConfig
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+      controller user
+      do
+        config <- fetch configCid
+        assertMsg "config.vaultCid must equal vault" (config.vaultCid == vaultCid)
+        assertMsg "config.status must be Settled" (config.status == Settled)
+        position <- fetch positionCid
+        assertMsg "position.user must equal user" (position.user == user)
+        assertMsg "position.appProvider must equal appProvider" (position.appProvider == appProvider)
+        assertMsg "transfer.sender must equal appProvider" (transfer.sender == appProvider)
+        assertMsg "transfer.receiver must equal user" (transfer.receiver == user)
+        assertMsg "transfer.instrumentId must equal position instrumentId" (transfer.instrumentId == position.instrumentId)
+        assertMsg "lpAmount must not exceed position lpAmount" (lpAmount <= position.lpAmount)
+        let withdrawAmount = lpAmount * config.lpValue
+        assertMsg "withdrawAmount must equal transfer.amount" (withdrawAmount == transfer.amount)
+        res <- exercise factoryCid TransferFactory_Transfer with
+          expectedAdmin = expectedAdmin
+          transfer = transfer
+          extraArgs = extraArgs
+        archive positionCid
+        let remainingLpAmount = position.lpAmount - lpAmount
+        case featuredAppRightCid of
+          Some rightCid -> do
+            _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
+            pure ()
+          None -> pure ()
+        if remainingLpAmount > 0.0
+          then do
+            _ <- create InstrumentCallPosition with
+              user = user
+              appProvider = appProvider
+              instrumentId = position.instrumentId
+              vaultCid = vaultCid
+              lpAmount = remainingLpAmount
+              lpValue = position.lpValue
+            pure res
+          else pure res
+
+    choice WithdrawRequest_Reject : ()
+      controller appProvider
+      do
+        pure ()
+
+
+template InstrumentCallPosition
+  with
+    user : Party
+    appProvider : Party
+    instrumentId : InstrumentId
+    vaultCid : ContractId InstrumentCallVault
+    lpAmount : Decimal
+    lpValue : Decimal
+  where
+    signatory user, appProvider
+

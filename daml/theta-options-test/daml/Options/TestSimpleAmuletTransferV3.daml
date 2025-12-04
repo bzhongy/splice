@@ -1,0 +1,70 @@
+module Options.TestSimpleAmuletTransferV3 where
+
+import Daml.Script
+import DA.Time
+
+import Options.SimpleAmuletTransferV3
+
+import Splice.Api.Token.MetadataV1
+import DA.TextMap qualified as TextMap
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.TransferInstructionV1 qualified as TI
+import Splice.Testing.Registries.AmuletRegistry qualified as AmuletRegistry
+import Splice.Testing.TokenStandard.RegistryApi qualified as RegistryApi
+import Splice.Testing.Utils (emptyExtraArgs, submitWithDisclosures', queryDisclosure')
+
+
+testSimpleAmuletTransferV3 : Script ()
+testSimpleAmuletTransferV3 = script do
+  let cfg = AmuletRegistry.defaultAmuletRegistryConfig with noTransferFee = True
+  registry <- AmuletRegistry.initialize cfg
+
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  appProvider <- allocateParty "appProvider"
+
+  holdingCid <- AmuletRegistry.tapFaucet registry alice 100.0
+
+  now <- getTime
+
+  vaultCid <- submitMulti [bob, appProvider] [] do
+    createCmd AmuletVault with
+      vaultParty = bob
+      appProvider = appProvider
+      instrumentId = HoldingV1.InstrumentId { admin = registry.dso, id = "Amulet" }
+
+  let transfer = TI.Transfer with
+        sender = alice
+        receiver = bob
+        amount = 1.0
+        instrumentId = HoldingV1.InstrumentId { admin = registry.dso, id = "Amulet" }
+        requestedAt = now
+        executeBefore = now `addRelTime` days 1
+        inputHoldingCids = [holdingCid]
+        meta = Metadata with values = TextMap.fromList [("splice.lfdecentralizedtrust.org/reason", "test-deposit")]
+
+  enrichedChoice <- RegistryApi.getTransferFactory registry TI.TransferFactory_Transfer with
+    expectedAdmin = registry.dso
+    transfer
+    extraArgs = emptyExtraArgs
+
+  let factoryCid = enrichedChoice.factoryCid
+
+  -- disclose the vault from bob or appProvider, who can see it
+  vaultDisc <- queryDisclosure' @AmuletVault bob vaultCid
+  let discs = enrichedChoice.disclosures <> vaultDisc
+
+  _ <- submitWithDisclosures' alice discs do
+    exerciseCmd vaultCid (Deposit with
+      factoryCid
+      expectedAdmin = registry.dso
+      user = alice
+      transfer
+      extraArgs = enrichedChoice.arg.extraArgs)
+
+  positions <- queryFilter @AmuletPosition alice (\p -> p.user == alice && p.vaultParty == bob && p.appProvider == appProvider && p.instrumentId == HoldingV1.InstrumentId { admin = registry.dso, id = "Amulet" } && p.amount == 1.0)
+  case positions of
+    (_ :: _) -> pure ()
+    [] -> fail "position not found"
+
+

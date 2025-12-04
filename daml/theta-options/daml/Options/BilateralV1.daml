@@ -1,0 +1,227 @@
+module Options.BilateralV1 where
+
+import Splice.Util (HasCheckedFetch(..), fetchAndArchive, require)
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.TransferInstructionV1
+import Splice.Api.FeaturedAppRightV1
+
+data BilateralParams = BilateralParams with
+    description : Text
+  deriving (Eq, Show)
+
+data BilateralGroup = BilateralGroup with
+    user : Party
+    counterparty : Party
+  deriving (Show, Eq)
+
+template Bilateral with
+    user : Party
+    counterparty : Party
+    expiresAt : Time
+    params : BilateralParams
+    amount : Decimal
+  where
+    signatory user, counterparty
+    
+    choice Bilateral_Expire : ()
+      with
+        actor : Party
+      controller actor
+      do
+        now <- getTime
+        require "Actor is a signatory" (actor `elem` signatory this)
+        require "Agreement has expired" (now > expiresAt)
+
+
+    nonconsuming choice Bilateral_Extend : ContractId BilateralExtensionRequest
+      with
+        newExpirationDate : Time
+        extensionReason : Text
+      controller user, counterparty
+      do
+        now <- getTime
+        require "New expiration must be in the future" (newExpirationDate > now)
+        require "New expiration must be later than current" (newExpirationDate > expiresAt)
+        
+        create BilateralExtensionRequest with
+          user, counterparty
+          originalAgreementId = self
+          newExpirationDate
+          extensionReason
+
+    nonconsuming choice Bilateral_RequestCancel : ContractId BilateralCancelRequest
+      with
+        actor : Party
+        reason : Text
+      controller actor
+      do
+        require "Actor is a signatory" (actor `elem` signatory this)
+        let receiver = if actor == user then counterparty else user
+        create BilateralCancelRequest with
+          user, counterparty
+          originalAgreementId = self
+          canceler = actor
+          receiver
+          reason
+
+template BilateralExtensionRequest with
+    user : Party
+    counterparty : Party
+    originalAgreementId : ContractId Bilateral
+    newExpirationDate : Time
+    extensionReason : Text
+  where
+    signatory user, counterparty
+
+    choice BilateralExtensionRequest_Accept : ContractId Bilateral
+      controller user, counterparty
+      do
+        originalAgreement <- fetchAndArchive BilateralGroup {user, counterparty} originalAgreementId
+        
+        create Bilateral with
+          user = originalAgreement.user
+          counterparty = originalAgreement.counterparty
+          expiresAt = newExpirationDate
+          params = originalAgreement.params
+          amount = originalAgreement.amount
+
+    choice BilateralExtensionRequest_Cancel : ()
+      with
+        actor : Party
+      controller actor
+      do
+        require "Actor is a signatory" (actor `elem` signatory this)
+
+template BilateralCancelRequest with
+    user : Party
+    counterparty : Party
+    originalAgreementId : ContractId Bilateral
+    canceler : Party
+    receiver : Party
+    reason : Text
+  where
+    signatory canceler
+    observer receiver
+
+    choice BilateralCancelRequest_Accept : ()
+      controller receiver
+      do
+        _ <- fetchAndArchive BilateralGroup {user, counterparty} originalAgreementId
+        pure ()
+
+    choice BilateralCancelRequest_Reject : ()
+      controller receiver
+      do
+        pure ()
+
+    choice BilateralCancelRequest_Withdraw : ()
+      controller canceler
+      do
+        pure ()
+
+template BilateralRequestSend with
+    user : Party
+    counterparty : Party
+    expiresAt : Time
+    params : BilateralParams
+    factoryCid : ContractId TransferFactory
+    expectedAdmin : Party
+    transfer : Transfer
+    extraArgs : ExtraArgs
+    featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+    beneficiaries : [AppRewardBeneficiary]
+
+  where
+    signatory user
+    observer counterparty
+
+    choice BilateralRequestSend_Accept : (ContractId Bilateral, TransferInstructionResult)
+      controller counterparty
+      do
+        res <- exercise factoryCid TransferFactory_Transfer with
+          expectedAdmin = expectedAdmin
+          transfer = transfer
+          extraArgs = extraArgs
+        case featuredAppRightCid of
+          Some rightCid -> do
+            _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = beneficiaries
+            pure ()
+          None -> pure ()
+        bilateralCid <- create Bilateral with
+          user, counterparty
+          expiresAt
+          params
+          amount = transfer.amount
+        pure (bilateralCid, res)
+
+    choice BilateralRequestSend_Reject : ()
+      with
+        rejectionReason : Text
+      controller counterparty
+      do 
+        pure ()
+
+    choice BilateralRequestSend_Cancel : ()
+      controller user
+      do 
+        pure ()
+
+template BilateralRequestReceive with
+    user : Party
+    counterparty : Party
+    expiresAt : Time
+    params : BilateralParams
+    amount : Decimal
+    instrumentId : InstrumentId
+
+  where
+    signatory user
+    observer counterparty
+
+    choice BilateralRequestReceive_Accept : (ContractId Bilateral, TransferInstructionResult)
+      with
+        factoryCid : ContractId TransferFactory
+        expectedAdmin : Party
+        transfer : Transfer
+        extraArgs : ExtraArgs
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+        beneficiaries : [AppRewardBeneficiary]
+      controller counterparty
+      do
+        require "Transfer amount must match requested amount" (transfer.amount == amount)
+        require "Transfer instrumentId must match requested instrumentId" (transfer.instrumentId == instrumentId)
+        res <- exercise factoryCid TransferFactory_Transfer with
+          expectedAdmin = expectedAdmin
+          transfer = transfer
+          extraArgs = extraArgs
+        case featuredAppRightCid of
+          Some rightCid -> do
+            _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = beneficiaries
+            pure ()
+          None -> pure ()
+        bilateralCid <- create Bilateral with
+          user, counterparty
+          expiresAt
+          params
+          amount
+        pure (bilateralCid, res)
+
+    choice BilateralRequestReceive_Reject : ()
+      with
+        rejectionReason : Text
+      controller counterparty
+      do 
+        pure ()
+
+    choice BilateralRequestReceive_Cancel : ()
+      controller user
+      do 
+        pure ()
+
+instance HasCheckedFetch Bilateral BilateralGroup where
+  contractGroupId Bilateral{..} = BilateralGroup with ..
+
+

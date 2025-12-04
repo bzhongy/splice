@@ -1,0 +1,34 @@
+module Options.TestSimpleAmuletTransferV4 where
+
+import Daml.Script
+
+import Options.SimpleAmuletTransferV4
+
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Testing.Registries.AmuletRegistry qualified as AmuletRegistry
+
+
+testSimpleAmuletTransferV4 : Script ()
+testSimpleAmuletTransferV4 = script do
+  let cfg = AmuletRegistry.defaultAmuletRegistryConfig with noTransferFee = True
+  registry <- AmuletRegistry.initialize cfg
+
+  bob <- allocateParty "bob"
+  appProvider <- allocateParty "appProvider"
+
+  requestCid <- submit appProvider do
+    createCmd AmuletVaultRequest with
+      vaultParty = bob
+      appProvider = appProvider
+      instrumentId = HoldingV1.InstrumentId { admin = registry.dso, id = "Amulet" }
+
+  vaultCid <- submit bob do
+    exerciseCmd requestCid AmuletVaultRequest_Accept
+
+  vaults <- queryFilter @AmuletVault appProvider (\v -> v.vaultParty == bob && v.appProvider == appProvider && v.instrumentId == HoldingV1.InstrumentId { admin = registry.dso, id = "Amulet" })
+  case vaults of
+    (_ :: _) -> pure ()
+    [] -> fail "vault not found"
+
+
+
