@@ -1,0 +1,21 @@
+-- | Ethereum signature validation utilities
+module Evm.Crypto where
+
+import DA.Crypto.Text (BytesHex, PublicKeyHex, secp256k1WithEcdsaOnly)
+import Crypto.DerEncoding
+
+-- | Validate a raw ECDSA signature
+-- Takes the message hash, public key, and raw signature components (r, s)
+-- Returns True if the signature is valid, False otherwise
+--
+-- Process:
+--   1. Convert raw signature (r, s) to DER format
+--   2. Convert secp256k1 public key to DER format
+--   3. Verify using secp256k1WithEcdsaOnly
+validateSignature : BytesHex -> PublicKeyHex -> BytesHex -> BytesHex -> Bool
+validateSignature messageHash publicKey r s =
+  let
+    derSignature = rawToDerSignature r s
+    derPublicKey = secp256k1PublicKeyToDer publicKey
+  in
+    secp256k1WithEcdsaOnly derSignature messageHash derPublicKey

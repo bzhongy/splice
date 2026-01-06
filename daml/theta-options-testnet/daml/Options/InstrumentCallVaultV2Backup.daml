@@ -1,4 +1,4 @@
-module Options.PrivateCallVaultV2 where
+module Options.InstrumentCallVaultV2Backup where
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV1
@@ -11,26 +11,23 @@ data VaultStatus = Active | Locked | Settled
 
 
 
-template PrivateCallVault
+template InstrumentCallVault
   with
     appProvider : Party
-    vaultUser : Party
     instrumentId : InstrumentId
     name : Text
   where
     signatory appProvider
-    observer vaultUser
 
-    nonconsuming choice PrivateCallVault_Initialize : ContractId PrivateCallVaultConfig
+    nonconsuming choice InstrumentCallVault_Initialize : ContractId InstrumentCallVaultConfig
       with
         expiryDate : Time
         epochDays : Decimal
       controller appProvider
       do
-        create PrivateCallVaultConfig with
+        create InstrumentCallVaultConfig with
           appProvider
           vaultCid = self
-          vaultUser
           lpValue = 1.0
           strike = 0.0
           epoch = 0
@@ -43,18 +40,17 @@ template PrivateCallVault
           expiryDate
           epochDays
 
-    nonconsuming choice PrivateCallVault_Deposit : TransferInstructionResult
+    nonconsuming choice InstrumentCallVault_Deposit : TransferInstructionResult
       with
         factoryCid : ContractId TransferFactory
         expectedAdmin : Party
         user : Party
         transfer : Transfer
         extraArgs : ExtraArgs
-        configCid : ContractId PrivateCallVaultConfig
+        configCid : ContractId InstrumentCallVaultConfig
         featuredAppRightCid : Optional (ContractId FeaturedAppRight)
       controller user
       do
-        assertMsg "user must equal vaultUser" (user == vaultUser)
         assertMsg "transfer.sender must equal user" (transfer.sender == user)
         assertMsg "transfer.receiver must equal appProvider" (transfer.receiver == appProvider)
         assertMsg "transfer.instrumentId must equal vault instrumentId" (transfer.instrumentId == instrumentId)
@@ -67,7 +63,7 @@ template PrivateCallVault
           transfer = transfer
           extraArgs = extraArgs
         let lpAmount = transfer.amount / config.lpValue
-        _ <- create PrivateCallPosition with
+        _ <- create InstrumentCallPosition with
           user = user
           appProvider = appProvider
           instrumentId = instrumentId
@@ -77,27 +73,25 @@ template PrivateCallVault
         case featuredAppRightCid of
           Some rightCid -> do
             _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
-              beneficiaries = [ AppRewardBeneficiary with
-                                  beneficiary = appProvider
-                                  weight = 1.0
-                              ]
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
             pure ()
           None -> pure ()
         pure res
 
-    nonconsuming choice PrivateCallVault_TopUp : TransferInstructionResult
+    nonconsuming choice InstrumentCallVault_TopUp : TransferInstructionResult
       with
         factoryCid : ContractId TransferFactory
         expectedAdmin : Party
         user : Party
         transfer : Transfer
         extraArgs : ExtraArgs
-        existingPositionCid : ContractId PrivateCallPosition
-        configCid : ContractId PrivateCallVaultConfig
+        existingPositionCid : ContractId InstrumentCallPosition
+        configCid : ContractId InstrumentCallVaultConfig
         featuredAppRightCid : Optional (ContractId FeaturedAppRight)
       controller user
       do
-        assertMsg "user must equal vaultUser" (user == vaultUser)
         assertMsg "transfer.sender must equal user" (transfer.sender == user)
         assertMsg "transfer.receiver must equal appProvider" (transfer.receiver == appProvider)
         assertMsg "transfer.instrumentId must equal vault instrumentId" (transfer.instrumentId == instrumentId)
@@ -119,7 +113,7 @@ template PrivateCallVault
         let oldValue = existingPosition.lpAmount * existingPosition.lpValue
         let newValue = newLpAmount * config.lpValue
         let averagedLpValue = (oldValue + newValue) / combinedLpAmount
-        _ <- create PrivateCallPosition with
+        _ <- create InstrumentCallPosition with
           user = user
           appProvider = appProvider
           instrumentId = instrumentId
@@ -129,15 +123,14 @@ template PrivateCallVault
         case featuredAppRightCid of
           Some rightCid -> do
             _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
-              beneficiaries = [ AppRewardBeneficiary with
-                                  beneficiary = appProvider
-                                  weight = 1.0
-                              ]
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
             pure ()
           None -> pure ()
         pure res
 
-    nonconsuming choice PrivateCallVault_SendReward : TransferInstructionResult
+    nonconsuming choice InstrumentCallVault_SendReward : TransferInstructionResult
       with
         factoryCid : ContractId TransferFactory
         expectedAdmin : Party
@@ -156,13 +149,13 @@ template PrivateCallVault
           beneficiaries = beneficiaries
         pure res
 
-    nonconsuming choice PrivateCallVault_MarginCheck : TransferInstructionResult
+    nonconsuming choice InstrumentCallVault_MarginCheck : TransferInstructionResult
       with
         factoryCid : ContractId TransferFactory
         expectedAdmin : Party
         transfer : Transfer
         extraArgs : ExtraArgs
-        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+        featuredAppRightCid : ContractId FeaturedAppRight
         beneficiaries : [AppRewardBeneficiary]
       controller appProvider
       do
@@ -171,23 +164,19 @@ template PrivateCallVault
           expectedAdmin = expectedAdmin
           transfer = transfer
           extraArgs = extraArgs
-        case featuredAppRightCid of
-          Some rightCid -> do
-            _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
-              beneficiaries = beneficiaries
-            pure ()
-          None -> pure ()
+        _ <- exercise featuredAppRightCid FeaturedAppRight_CreateActivityMarker with
+          beneficiaries = beneficiaries
         pure res
 
-    nonconsuming choice PrivateCallVault_RequestWithdraw : ContractId WithdrawRequest
+
+    nonconsuming choice InstrumentCallVault_RequestWithdraw : ContractId WithdrawRequest
       with
         user : Party
-        positionCid : ContractId PrivateCallPosition
+        positionCid : ContractId InstrumentCallPosition
         lpAmount : Decimal
-        configCid : ContractId PrivateCallVaultConfig
+        configCid : ContractId InstrumentCallVaultConfig
       controller user
       do
-        assertMsg "user must equal vaultUser" (user == vaultUser)
         config <- fetch configCid
         assertMsg "config.vaultCid must equal vault" (config.vaultCid == self)
         assertMsg "vault must not be Locked to request withdraw" (config.status /= Locked)
@@ -203,15 +192,14 @@ template PrivateCallVault
           positionCid
           vaultCid = self
 
-    nonconsuming choice PrivateCallVault_RequestWithdrawByProvider : ContractId WithdrawRequest
+    nonconsuming choice InstrumentCallVault_RequestWithdrawByProvider : ContractId WithdrawRequest
       with
         user : Party
-        positionCid : ContractId PrivateCallPosition
+        positionCid : ContractId InstrumentCallPosition
         lpAmount : Decimal
-        configCid : ContractId PrivateCallVaultConfig
+        configCid : ContractId InstrumentCallVaultConfig
       controller appProvider
       do
-        assertMsg "user must equal vaultUser" (user == vaultUser)
         config <- fetch configCid
         assertMsg "config.vaultCid must equal vault" (config.vaultCid == self)
         assertMsg "vault must not be Locked to request withdraw" (config.status /= Locked)
@@ -227,9 +215,9 @@ template PrivateCallVault
           positionCid
           vaultCid = self
 
-    nonconsuming choice PrivateCallVault_Lock : ContractId PrivateCallVaultConfig
+    nonconsuming choice InstrumentCallVault_Lock : ContractId InstrumentCallVaultConfig
       with
-        configCid : ContractId PrivateCallVaultConfig
+        configCid : ContractId InstrumentCallVaultConfig
         newTotalSupply : Decimal
         featuredAppRightCid : Optional (ContractId FeaturedAppRight)
       controller appProvider
@@ -244,16 +232,15 @@ template PrivateCallVault
         case featuredAppRightCid of
           Some rightCid -> do
             _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
-              beneficiaries = [ AppRewardBeneficiary with
-                                  beneficiary = appProvider
-                                  weight = 1.0
-                              ]
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
             pure newConfigCid
           None -> pure newConfigCid
 
-    nonconsuming choice PrivateCallVault_RequestPremium : ContractId PrivateCallVaultConfig
+    nonconsuming choice InstrumentCallVault_RequestPremium : ContractId InstrumentCallVaultConfig
       with
-        configCid : ContractId PrivateCallVaultConfig
+        configCid : ContractId InstrumentCallVaultConfig
         buyerParty : Party
         premium : Decimal
         newStrike : Decimal
@@ -272,9 +259,9 @@ template PrivateCallVault
           epochDays = newEpochDays
           expiryDate = newExpiryDate
 
-    nonconsuming choice PrivateCallVault_SettleEpoch : ContractId PrivateCallVaultConfig
+    nonconsuming choice InstrumentCallVault_SettleEpoch : ContractId InstrumentCallVaultConfig
       with
-        configCid : ContractId PrivateCallVaultConfig
+        configCid : ContractId InstrumentCallVaultConfig
         settledPrice : Decimal
         epochEndTotalSupply : Decimal
         newExpiryDate : Time
@@ -317,19 +304,17 @@ template PrivateCallVault
         case featuredAppRightCid of
           Some rightCid -> do
             _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
-              beneficiaries = [ AppRewardBeneficiary with
-                                  beneficiary = appProvider
-                                  weight = 1.0
-                              ]
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
             pure newConfigCid
           None -> pure newConfigCid
 
 
-template PrivateCallVaultConfig
+template InstrumentCallVaultConfig
   with
     appProvider : Party
-    vaultCid : ContractId PrivateCallVault
-    vaultUser : Party
+    vaultCid : ContractId InstrumentCallVault
     lpValue : Decimal
     strike : Decimal
     epoch : Int
@@ -343,9 +328,9 @@ template PrivateCallVaultConfig
     epochDays : Decimal
   where
     signatory appProvider
-    observer vaultUser, buyer
+    observer buyer
 
-    choice PrivateCallVaultConfig_UpdateEpochDays : ContractId PrivateCallVaultConfig
+    choice InstrumentCallVaultConfig_UpdateEpochDays : ContractId InstrumentCallVaultConfig
       with
         newEpochDays : Decimal
       controller appProvider
@@ -353,7 +338,7 @@ template PrivateCallVaultConfig
         archive self
         create this with epochDays = newEpochDays
 
-    choice PrivateCallVaultConfig_StartEpoch : (ContractId PrivateCallVaultConfig, TransferInstructionResult)
+    choice InstrumentCallVaultConfig_StartEpoch : (ContractId InstrumentCallVaultConfig, TransferInstructionResult)
       with
         factoryCid : ContractId TransferFactory
         expectedAdmin : Party
@@ -376,14 +361,12 @@ template PrivateCallVaultConfig
           totalSupply = pendingTotalSupply + premium
           status = Active
           lpValue = newLpValue
-        vault <- fetch vaultCid
         case featuredAppRightCid of
           Some rightCid -> do
             _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
-              beneficiaries = [ AppRewardBeneficiary with
-                                  beneficiary = appProvider
-                                  weight = 1.0
-                              ]
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
             pure ()
           None -> pure ()
         pure (newConfig, res)
@@ -395,8 +378,8 @@ template WithdrawRequest
     instrumentId : InstrumentId
     user : Party
     lpAmount : Decimal
-    positionCid : ContractId PrivateCallPosition
-    vaultCid : ContractId PrivateCallVault
+    positionCid : ContractId InstrumentCallPosition
+    vaultCid : ContractId InstrumentCallVault
   where
     signatory user
     observer appProvider
@@ -407,7 +390,7 @@ template WithdrawRequest
         expectedAdmin : Party
         transfer : Transfer
         extraArgs : ExtraArgs
-        configCid : ContractId PrivateCallVaultConfig
+        configCid : ContractId InstrumentCallVaultConfig
         featuredAppRightCid : Optional (ContractId FeaturedAppRight)
       controller appProvider
       do
@@ -432,15 +415,14 @@ template WithdrawRequest
         case featuredAppRightCid of
           Some rightCid -> do
             _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
-              beneficiaries = [ AppRewardBeneficiary with
-                                  beneficiary = appProvider
-                                  weight = 1.0
-                              ]
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
             pure ()
           None -> pure ()
         if remainingLpAmount > 0.0
           then do
-            _ <- create PrivateCallPosition with
+            _ <- create InstrumentCallPosition with
               user = user
               appProvider = appProvider
               instrumentId = position.instrumentId
@@ -456,7 +438,7 @@ template WithdrawRequest
         expectedAdmin : Party
         transfer : Transfer
         extraArgs : ExtraArgs
-        configCid : ContractId PrivateCallVaultConfig
+        configCid : ContractId InstrumentCallVaultConfig
         featuredAppRightCid : Optional (ContractId FeaturedAppRight)
       controller user
       do
@@ -481,15 +463,14 @@ template WithdrawRequest
         case featuredAppRightCid of
           Some rightCid -> do
             _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
-              beneficiaries = [ AppRewardBeneficiary with
-                                  beneficiary = appProvider
-                                  weight = 1.0
-                              ]
+              beneficiaries = [AppRewardBeneficiary with
+                beneficiary = appProvider
+                weight = 1.0]
             pure ()
           None -> pure ()
         if remainingLpAmount > 0.0
           then do
-            _ <- create PrivateCallPosition with
+            _ <- create InstrumentCallPosition with
               user = user
               appProvider = appProvider
               instrumentId = position.instrumentId
@@ -505,12 +486,12 @@ template WithdrawRequest
         pure ()
 
 
-template PrivateCallPosition
+template InstrumentCallPosition
   with
     user : Party
     appProvider : Party
     instrumentId : InstrumentId
-    vaultCid : ContractId PrivateCallVault
+    vaultCid : ContractId InstrumentCallVault
     lpAmount : Decimal
     lpValue : Decimal
   where

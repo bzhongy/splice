@@ -1,0 +1,1029 @@
+module TestVerifier where
+
+import Daml.Script
+import DA.Assert ((===), (=/=))
+import DA.Map qualified as Map
+import qualified DA.Set as Set
+import DA.List (tail, (!!))
+import DA.Crypto.Text (BytesHex)
+import MasterVerifierConfigFactory
+import VerifierConfig
+import Verifier
+import Interface.ManagedContractFactory
+import Interface.ManagedContract
+import Interface.ConfirmedOwner
+import Interface.Observable
+import Types.VerifierConfigState
+import PayloadBuilder
+
+
+-- Create a test MasterVerifierConfigFactory with empty state
+createTestFactory : Party -> Script (ContractId MasterVerifierConfigFactory)
+createTestFactory owner = do
+  submit owner $ createCmd MasterVerifierConfigFactory with
+    confirmedOwnerView = ConfirmedOwnerView with
+      owner = owner
+      pendingOwner = None
+    observableView = ObservableView with
+      observers = []
+    managedContractFactoryView = ManagedContractFactoryView with
+      contracts = Set.empty
+    verifierConfigStateView = VerifierConfigStateView with
+      verifierStates = Map.empty
+
+-- Setup factory with standard config (16 signers, f=5)
+setupFactoryWithConfig : Party -> Script (ContractId MasterVerifierConfigFactory)
+setupFactoryWithConfig owner = do
+  factoryCid <- createTestFactory owner
+  submit owner $ exerciseCmd factoryCid SetViewConfig with
+    configDigest = getConfigDigest
+    signers = take 16 getSignerAddresses  -- Use only first 16 signers for standard tests
+    f = 5
+
+-- Setup factory with custom config
+setupFactoryWithCustomConfig : Party -> BytesHex -> [Text] -> Int -> Script (ContractId MasterVerifierConfigFactory)
+setupFactoryWithCustomConfig owner configDigest signers f = do
+  factoryCid <- createTestFactory owner
+  submit owner $ exerciseCmd factoryCid SetViewConfig with
+    configDigest = configDigest
+    signers = signers
+    f = f
+
+-- Deploy VerifierConfig for a user
+deployUserConfig : ContractId MasterVerifierConfigFactory -> Party -> Party -> Script (ContractId VerifierConfig)
+deployUserConfig factoryCid owner user = do
+  _ <- submit owner $ exerciseCmd
+    (toInterfaceContractId @ManagedContractFactory factoryCid)
+    NewContract with users = [user]
+  
+  -- Query the ledger for the user's VerifierConfig by UUID
+  queryVerifierConfigByUuid owner (show user)
+
+-- Helper to query VerifierConfig by UUID
+queryVerifierConfigByUuid : Party -> Text -> Script (ContractId VerifierConfig)
+queryVerifierConfigByUuid party uuid = do
+  configs <- query @VerifierConfig party
+  let [(cid, _)] = filter (\(_, config) -> config.managedContractView.uuid == uuid) configs
+  return cid
+
+-- Create a test Verifier contract
+createTestVerifier : Party -> [Party] -> Script (ContractId Verifier)
+createTestVerifier owner observers = do
+  submit owner $ createCmd Verifier with
+    owner = owner
+    observers = observers
+
+-- Full standard setup: factory + config + user deployment (16 signers, f=5)
+setupStandardTest : Party -> Party -> Script (ContractId MasterVerifierConfigFactory, ContractId VerifierConfig)
+setupStandardTest owner user = do
+  factoryCid <- setupFactoryWithConfig owner
+  userConfigCid <- deployUserConfig factoryCid owner user
+  return (factoryCid, userConfigCid)
+
+-- Setup test with maximum oracles (31 signers, f=10)
+setupMaximumOracleTest : Party -> Party -> Script (ContractId MasterVerifierConfigFactory, ContractId VerifierConfig)
+setupMaximumOracleTest owner user = do
+  factoryCid <- setupFactoryWithCustomConfig owner getConfigDigest getSignerAddresses 10
+  userConfigCid <- deployUserConfig factoryCid owner user
+  return (factoryCid, userConfigCid)
+
+-- Setup test with inactive config (16 signers, f=5, then deactivated)
+setupStandardTestWithInactiveConfig : Party -> Party -> Script (ContractId MasterVerifierConfigFactory, ContractId VerifierConfig)
+setupStandardTestWithInactiveConfig owner user = do
+  factoryCid <- setupFactoryWithConfig owner
+  factoryCid2 <- submit owner $ exerciseCmd factoryCid DeactivateViewConfig with
+    configDigest = getConfigDigest
+  userConfigCid <- deployUserConfig factoryCid2 owner user
+  return (factoryCid2, userConfigCid)
+
+-- Setup test with multiple configs
+setupMultiConfigTest : Party -> Party -> [(BytesHex, [Text], Int)] -> Script (ContractId MasterVerifierConfigFactory, ContractId VerifierConfig)
+setupMultiConfigTest owner user configs = do
+  factoryCid <- createTestFactory owner
+  factoryCidWithConfigs <- foldl (\accScript (digest, signers, f) -> do
+    acc <- accScript
+    submit owner $ exerciseCmd acc SetViewConfig with
+      configDigest = digest
+      signers = signers
+      f = f
+    ) (return factoryCid) configs
+  userConfigCid <- deployUserConfig factoryCidWithConfigs owner user
+  return (factoryCidWithConfigs, userConfigCid)
+
+
+-- Test: Verify with all 16 signers (success case)
+testVerifySuccess : Script ()
+testVerifySuccess = script do
+  -- Allocate parties
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory with standard config and deploy user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Verify user config was created with correct data
+  Some userConfig <- queryContractId user verifierConfigCid
+  userConfig.confirmedOwnerView.owner === owner
+  userConfig.observableView.observers === [user]
+  Map.size userConfig.verifierConfigStateView.verifierStates === 1
+  
+  -- Verify config state within user config
+  case Map.lookup getConfigDigest userConfig.verifierConfigStateView.verifierStates of
+    None -> abort "Config digest not found in user config"
+    Some state -> do
+      state.f === 5
+      state.isActive === True
+      Map.size state.oracles === 16
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Generate payload with f+1 = 6 signers (indices 0-5)
+  let signerIndices = [0,1,2,3,4,5]
+  let payloadComponents = createPayloadFromIndices signerIndices
+  let fullPayload = encodePayload payloadComponents
+
+  -- User calls Verify with generated payload
+  reportData <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+  -- Verify returned reportData matches expected
+  reportData === getReportBytes
+
+-- Test: Duplicate signer detection
+testVerifyDuplicateSigner : Script ()
+testVerifyDuplicateSigner = script do
+  -- Allocate parties
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create payload with duplicate signer (signer 0 appears twice)
+  let duplicateIndices = [0,0,1,2,3,4]
+  let payloadComponents = createPayloadFromIndices duplicateIndices
+  let fullPayload = encodePayload payloadComponents
+
+  -- Should fail due to duplicate signer
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+-- Test: Invalid signature (wrong r value)
+testVerifyInvalidSignature : Script ()
+testVerifyInvalidSignature = script do
+  -- Allocate parties
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create valid payload then corrupt one signature
+  let validIndices = [0,1,2,3,4,5]
+  let validComponents = createPayloadFromIndices validIndices
+  let invalidComponents = validComponents with
+        rs = ["0000000000000000000000000000000000000000000000000000000000000001"] <> tail validComponents.rs
+  let fullPayload = encodePayload invalidComponents
+
+  -- Should fail due to invalid signature
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+-- Test: Config digest not found
+testVerifyConfigDigestNotFound : Script ()
+testVerifyConfigDigestNotFound = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create payload with different config digest
+  let validComponents = createPayloadFromIndices [0,1,2,3,4,5]
+  let differentDigest = "1111111111111111111111111111111111111111111111111111111111111111"
+  let modifiedComponents = validComponents with
+        context = [differentDigest, validComponents.context !! 1, validComponents.context !! 2]
+  let fullPayload = encodePayload modifiedComponents
+
+  -- Should fail with DigestNotSet error
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+-- Test: Inactive config
+testVerifyInactiveConfig : Script ()
+testVerifyInactiveConfig = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory with inactive config
+  (_factoryCid, verifierConfigCid) <- setupStandardTestWithInactiveConfig owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create valid payload
+  let validPayload = encodePayload (createPayloadFromIndices [0,1,2,3,4,5])
+
+  -- Should fail with DigestInactive error
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = validPayload
+    sender = user
+
+-- Test: Too few signatures
+testVerifyTooFewSignatures : Script ()
+testVerifyTooFewSignatures = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create payload with only f=5 signatures instead of f+1=6
+  let insufficientIndices = [0,1,2,3,4]
+  let payloadComponents = createPayloadFromIndices insufficientIndices
+  let fullPayload = encodePayload payloadComponents
+
+  -- Should fail with IncorrectSignatureCount error
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+-- Test: Too many signatures
+testVerifyTooManySignatures : Script ()
+testVerifyTooManySignatures = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create payload with f+2=7 signatures instead of f+1=6
+  let tooManyIndices = [0,1,2,3,4,5,6]
+  let payloadComponents = createPayloadFromIndices tooManyIndices
+  let fullPayload = encodePayload payloadComponents
+
+  -- Should fail with IncorrectSignatureCount error
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+-- Test: Mismatched rs/ss lengths  
+testVerifyMismatchedRsSs : Script ()
+testVerifyMismatchedRsSs = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create payload with mismatched rs/ss lengths
+  let validComponents = createPayloadFromIndices [0,1,2,3,4,5]
+  let mismatchedComponents = validComponents with
+        ss = tail validComponents.ss  -- Remove one s value
+  let fullPayload = encodePayload mismatchedComponents
+
+  -- Should fail with MismatchedSignatures error
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+-- Test: Minimum valid configuration (f=1, requires 2 signatures)
+testVerifyMinimumSigners : Script ()
+testVerifyMinimumSigners = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup with f=1 (requires 2 signatures)
+  (_factoryCid, verifierConfigCid) <- setupFactoryWithCustomConfig owner getConfigDigest (take 16 getSignerAddresses) 1
+    >>= \fCid -> deployUserConfig fCid owner user >>= \uCid -> return (fCid, uCid)
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create payload with 2 signatures (f+1=2)
+  let twoSignerIndices = [0,1]
+  let payloadComponents = createPayloadFromIndices twoSignerIndices
+  let fullPayload = encodePayload payloadComponents
+
+  -- Should succeed with 2 valid signatures
+  reportData <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+  reportData === getReportBytes
+
+-- Test: Exact signature count required (16 signatures when 6 required should fail)
+testVerifyExactSignatureCountRequired : Script ()
+testVerifyExactSignatureCountRequired = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Try to verify with all 16 signatures when only 6 are required
+  let allSignerIndices = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+  let payloadComponents = createPayloadFromIndices allSignerIndices
+  let fullPayload = encodePayload payloadComponents
+
+  -- Should fail with IncorrectSignatureCount error (requires exactly f+1, not more)
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+-- Test: Empty config digest
+testVerifyEmptyConfigDigest : Script ()
+testVerifyEmptyConfigDigest = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create payload with empty config digest in reportContext[0]
+  let validComponents = createPayloadFromIndices [0,1,2,3,4,5]
+  let emptyDigest = ""
+  let modifiedComponents = validComponents with
+        context = [emptyDigest, validComponents.context !! 1, validComponents.context !! 2]
+  let fullPayload = encodePayload modifiedComponents
+
+  -- Should fail - empty digest should not be found
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+-- Test: Multiple active configs - verify user config has multiple configs
+testVerifyWithMultipleActiveConfigs : Script ()
+testVerifyWithMultipleActiveConfigs = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  let configDigest1 = getConfigDigest
+  let configDigest2 = "1111111111111111111111111111111111111111111111111111111111111111"
+  let signers1 = take 16 getSignerAddresses  -- Use first 16 signers for standard tests
+  let signers2 = take 10 signers1  -- Use first 10 signers for second config
+  let f1 = 5
+  let f2 = 3
+
+  -- Setup factory with multiple configs
+  let configs = [(configDigest1, signers1, f1), (configDigest2, signers2, f2)]
+  (_factoryCid, verifierConfigCid) <- setupMultiConfigTest owner user configs
+
+  -- Verify user config has both configs
+  Some userConfig <- queryContractId user verifierConfigCid
+  Map.size userConfig.verifierConfigStateView.verifierStates === 2
+
+  -- Verify both configs exist with correct parameters
+  case Map.lookup configDigest1 userConfig.verifierConfigStateView.verifierStates of
+    None -> abort "Config1 not found"
+    Some state1 -> do
+      state1.f === f1
+      state1.isActive === True
+      Map.size state1.oracles === 16
+
+  case Map.lookup configDigest2 userConfig.verifierConfigStateView.verifierStates of
+    None -> abort "Config2 not found"
+    Some state2 -> do
+      state2.f === f2
+      state2.isActive === True
+      Map.size state2.oracles === 10
+
+  -- Test verification with first config using fixture signatures
+  -- (Note: fixture signatures are pre-generated for configDigest1)
+  verifierCid <- submit user $ createCmd Verifier with
+    owner = user
+    observers = []
+
+  let payload1 = encodePayload (createPayloadFromIndices [0,1,2,3,4,5])
+
+  reportData <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = payload1
+    sender = user
+
+  reportData === getReportBytes
+
+-- Test: Wrong config with correct signature count (wrong config for signers)
+testVerifyWrongConfigWithCorrectSignatureCount : Script ()
+testVerifyWrongConfigWithCorrectSignatureCount = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  let configDigest1 = getConfigDigest
+  let configDigest2 = "2222222222222222222222222222222222222222222222222222222222222222"
+  let signers1 = take 16 getSignerAddresses
+  let signers2 = take 10 getSignerAddresses
+  let f1 = 5  -- Requires 6 signatures
+  let f2 = 3  -- Requires 4 signatures
+
+  -- Setup factory with both configs
+  let configs = [(configDigest1, signers1, f1), (configDigest2, signers2, f2)]
+  (_factoryCid, verifierConfigCid) <- setupMultiConfigTest owner user configs
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create payload with 4 signatures (correct for config2) but use config1 digest
+  let wrongConfigComponents = createPayloadFromIndices [0,1,2,3]
+  let wrongPayload = encodePayload wrongConfigComponents
+
+  -- Should fail: config1 requires 6 signatures but only 4 provided
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = wrongPayload
+    sender = user
+
+-- Test: Config replacement - verify with new signers after replacement
+testVerifyAfterConfigReplacement : Script ()
+testVerifyAfterConfigReplacement = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  let configDigest = getConfigDigest
+  let oldSigners = take 10 getSignerAddresses
+  let newSigners = take 16 getSignerAddresses
+  let oldF = 3  -- Requires 4 signatures
+  let newF = 5  -- Requires 6 signatures
+
+  -- Setup with initial config (10 signers, f=3)
+  factoryCid1 <- setupFactoryWithCustomConfig owner configDigest oldSigners oldF
+
+  -- Deploy VerifierConfig for user with old config
+  factoryCid2Interface <- submit owner $ exerciseCmd
+    (toInterfaceContractId @ManagedContractFactory factoryCid1)
+    NewContract with users = [user]
+
+  let factoryCid2 = fromInterfaceContractId @MasterVerifierConfigFactory factoryCid2Interface
+
+  -- Replace config with new signers and f
+  factoryCid3 <- submit owner $ exerciseCmd factoryCid2 SetViewConfig with
+    configDigest = configDigest
+    signers = newSigners
+    f = newF
+
+  -- Get user's config contract ID before update by querying the ledger
+  configsBefore <- query @VerifierConfig owner
+  let [(userConfigCid3, _)] = filter (\(_, config) -> config.managedContractView.uuid == show user) configsBefore
+
+  -- Update user's config to get new settings
+  _ <- submit owner $ exerciseCmd
+    (toInterfaceContractId @ManagedContractFactory factoryCid3)
+    UpdateContract with contractIds = [toInterfaceContractId @ManagedContract userConfigCid3]
+
+  -- Query for the updated config
+  configsAfter <- query @VerifierConfig owner
+  let [(verifierConfigCid, _)] = filter (\(_, config) -> config.managedContractView.uuid == show user) configsAfter
+
+  -- Verify user config has updated parameters
+  Some userConfig <- queryContractId user verifierConfigCid
+  case Map.lookup configDigest userConfig.verifierConfigStateView.verifierStates of
+    None -> abort "Config not found"
+    Some state -> do
+      state.f === newF
+      Map.size state.oracles === 16
+
+  verifierCid <- submit user $ createCmd Verifier with
+    owner = user
+    observers = []
+
+  -- Verify with new signature count (6 signatures for newF=5)
+  let newPayload = encodePayload (createPayloadFromIndices [0,1,2,3,4,5])
+
+  reportData <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = newPayload
+    sender = user
+
+  reportData === getReportBytes
+
+  -- Old signature count (4) should now fail
+  let oldPayload = encodePayload (createPayloadFromIndices [0,1,2,3])
+
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = oldPayload
+    sender = user
+
+-- Test: Canton-specific - Verify as observer succeeds
+testVerifyAsObserver : Script ()
+testVerifyAsObserver = script do
+  owner <- allocateParty "Owner"
+  observer <- allocateParty "Observer"
+
+  -- Setup factory and observer config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner observer
+
+  -- Create Verifier with observer in observers list
+  verifierCid <- submit observer $ createCmd Verifier with
+    owner = observer
+    observers = [observer]
+
+  -- Observer should be able to verify (they're in observers list)
+  let payload = encodePayload (createPayloadFromIndices [0,1,2,3,4,5])
+
+  reportData <- submit observer $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = payload
+    sender = observer
+
+  reportData === getReportBytes
+
+-- Test: Non-owner cannot access other's config
+testVerifyWithWrongConfigOwnership : Script ()
+testVerifyWithWrongConfigOwnership = script do
+  owner <- allocateParty "Owner"
+  user1 <- allocateParty "User1"
+  user2 <- allocateParty "User2"
+
+  -- Setup factory and config for user1 only
+  (_factoryCid, user1VerifierConfigCid) <- setupStandardTest owner user1
+
+  -- User2 creates their own Verifier
+  user2VerifierCid <- submit user2 $ createCmd Verifier with
+    owner = user2
+    observers = []
+
+  let payload = encodePayload (createPayloadFromIndices [0,1,2,3,4,5])
+
+  -- User2 tries to verify using User1's config (should fail - user2 not an observer)
+  submitMustFail user2 $ exerciseCmd user2VerifierCid Verify with
+    configCid = user1VerifierConfigCid
+    signedReportBytes = payload
+    sender = user2
+
+-- Test: Different signer combinations
+testVerifyDifferentSignerCombinations : Script ()
+testVerifyDifferentSignerCombinations = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Use different signers (1-6 instead of 0-5)
+  let differentIndices = [1,2,3,4,5,6]
+  let payloadComponents = createPayloadFromIndices differentIndices
+  let fullPayload = encodePayload payloadComponents
+
+  -- Should succeed with different valid signers
+  reportData <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+  reportData === getReportBytes
+
+-- Test: Non-sequential signers
+testVerifyNonSequentialSigners : Script ()
+testVerifyNonSequentialSigners = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Use non-sequential signers
+  let nonSequentialIndices = [0,2,5,8,11,15]
+  let payloadComponents = createPayloadFromIndices nonSequentialIndices
+  let fullPayload = encodePayload payloadComponents
+
+  -- Should succeed with non-sequential valid signers
+  reportData <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+  reportData === getReportBytes
+
+-- Test: Hex prefix handling
+testVerifyWithHexPrefix : Script ()
+testVerifyWithHexPrefix = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory and user config
+  (_factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Create payload and add 0x prefix
+  let payloadComponents = createPayloadFromIndices [0,1,2,3,4,5]
+  let fullPayload = encodePayload payloadComponents
+  let prefixedPayload = "0x" <> fullPayload
+
+  -- Should succeed with 0x prefix (stripHexPrefix should handle it)
+  reportData <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = prefixedPayload
+    sender = user
+
+  reportData === getReportBytes
+
+-- Test: Verify with maximum oracles (31) and maximum signatures (11) - DoS risk assessment
+-- This test validates the worst-case O(m*n) complexity: 11 signatures × 31 oracles = 341 ECDSA validations
+testVerifyGasConsumptionWithMaximumOracles : Script ()
+testVerifyGasConsumptionWithMaximumOracles = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory with 31 signers (maximum oracles) and f=10 (maximum valid f for 31 signers)
+  (factoryCid, verifierConfigCid) <- setupMaximumOracleTest owner user
+
+  -- Verify user config was created with 31 oracles
+  Some userConfig <- queryContractId user verifierConfigCid
+  Map.size userConfig.verifierConfigStateView.verifierStates === 1
+  
+  case Map.lookup getConfigDigest userConfig.verifierConfigStateView.verifierStates of
+    None -> abort "Config digest not found"
+    Some state -> do
+      state.f === 10  -- Maximum f for 31 oracles (31 > 3*10=30)
+      Map.size state.oracles === 31  -- Maximum oracles
+      state.isActive === True
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Generate payload with f+1 = 11 signatures (maximum required signatures)
+  -- This represents worst-case complexity: 11 signatures × 31 oracles = 341 ECDSA validations
+  let signerIndices = [0,1,2,3,4,5,6,7,8,9,10]
+  let payloadComponents = createPayloadFromIndices signerIndices
+  let fullPayload = encodePayload payloadComponents
+
+  -- User calls Verify - this exercises maximum computational complexity
+  reportData <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = fullPayload
+    sender = user
+
+  -- Verify returned reportData matches expected
+  reportData === getReportBytes
+
+-- Test: Verify with absolute maximum oracles at boundary - edge case validation
+-- Tests various signature count scenarios with maximum oracle configuration
+testVerifyWithAbsoluteMaximumOracles : Script ()
+testVerifyWithAbsoluteMaximumOracles = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Setup factory with 31 signers (absolute maximum) and f=10
+  (factoryCid, verifierConfigCid) <- setupMaximumOracleTest owner user
+
+  -- Verify config state has all 31 oracles
+  Some userConfig <- queryContractId user verifierConfigCid
+  case Map.lookup getConfigDigest userConfig.verifierConfigStateView.verifierStates of
+    None -> abort "Config digest not found"
+    Some state -> do
+      state.f === 10
+      Map.size state.oracles === 31
+      state.isActive === True
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Test 1: Verify with exactly f+1=11 signatures succeeds (first 11 signers)
+  let exactSignatures = [0,1,2,3,4,5,6,7,8,9,10]
+  let payload1 = encodePayload (createPayloadFromIndices exactSignatures)
+  
+  reportData1 <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = payload1
+    sender = user
+  
+  reportData1 === getReportBytes
+
+  -- Test 2: Verify with exactly f+1=11 signatures succeeds (last 11 signers)
+  let lastSignatures = [20,21,22,23,24,25,26,27,28,29,30]
+  let payload2 = encodePayload (createPayloadFromIndices lastSignatures)
+  
+  reportData2 <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = payload2
+    sender = user
+  
+  reportData2 === getReportBytes
+
+  -- Test 3: Verify with non-sequential signatures succeeds (spread across all oracles)
+  let nonSequentialSignatures = [0,3,6,9,12,15,18,21,24,27,30]
+  let payload3 = encodePayload (createPayloadFromIndices nonSequentialSignatures)
+  
+  reportData3 <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = payload3
+    sender = user
+  
+  reportData3 === getReportBytes
+
+  -- Test 4: Verify with only f=10 signatures fails (insufficient)
+  let insufficientSignatures = [0,1,2,3,4,5,6,7,8,9]
+  let payload4 = encodePayload (createPayloadFromIndices insufficientSignatures)
+  
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = payload4
+    sender = user
+
+  -- Test 5: Verify with f+2=12 signatures fails (too many)
+  let tooManySignatures = [0,1,2,3,4,5,6,7,8,9,10,11]
+  let payload5 = encodePayload (createPayloadFromIndices tooManySignatures)
+  
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = payload5
+    sender = user
+
+-- Test: Verify with different signature orders (order independence)
+testVerifySignatureOrderIndependence : Script ()
+testVerifySignatureOrderIndependence = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  (factoryCid, verifierConfigCid) <- setupStandardTest owner user
+  
+  verifierCid <- submit user $ createCmd Verifier with
+    owner = user
+    observers = []
+
+  -- Signatures in ascending order [0,1,2,3,4,5]
+  let payload1 = createPayloadFromIndices [0,1,2,3,4,5]
+  let encodedPayload1 = encodePayload payload1
+
+  reportData1 <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = encodedPayload1
+    sender = user
+
+  reportData1 === getReportBytes
+
+  -- Signatures in descending order [5,4,3,2,1,0]
+  let payload2 = createPayloadFromIndices [5,4,3,2,1,0]
+  let encodedPayload2 = encodePayload payload2
+
+  reportData2 <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = encodedPayload2
+    sender = user
+
+  reportData2 === getReportBytes
+
+  -- Signatures in mixed order [2,5,1,4,0,3]
+  let payload3 = createPayloadFromIndices [2,5,1,4,0,3]
+  let encodedPayload3 = encodePayload payload3
+
+  reportData3 <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = encodedPayload3
+    sender = user
+
+  reportData3 === getReportBytes
+
+-- Test: Adding observer to VerifierConfig enables that observer to verify
+testAddObserverAllowsVerification : Script ()
+testAddObserverAllowsVerification = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+  newObserver <- allocateParty "NewObserver"
+
+  -- Setup factory and deploy config for user
+  (factoryCid, verifierConfigCid) <- setupStandardTest owner user
+
+  -- Verify initial state - only user is an observer
+  Some initialConfig <- queryContractId user verifierConfigCid
+  initialConfig.observableView.observers === [user]
+
+  -- newObserver cannot see the config yet (not an observer)
+  None <- queryContractId newObserver verifierConfigCid
+
+  -- newObserver creates their own Verifier
+  newObserverVerifierCid <- submit newObserver $ createCmd Verifier with
+    owner = newObserver
+    observers = []
+
+  -- Prepare a valid payload
+  let payload = encodePayload (createPayloadFromIndices [0,1,2,3,4,5])
+
+  -- newObserver tries to verify using the config - should FAIL (not an observer yet)
+  submitMustFail newObserver $ exerciseCmd newObserverVerifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = payload
+    sender = newObserver
+
+  -- Owner adds newObserver to the VerifierConfig using Observable interface
+  updatedConfigCid <- submit owner $ exerciseCmd
+    (toInterfaceContractId @Observable verifierConfigCid)
+    AddObserver with
+      newObserver = newObserver
+
+  let verifierConfigCid2 = fromInterfaceContractId @VerifierConfig updatedConfigCid
+
+  -- Verify newObserver is now in the observers list
+  Some updatedConfig <- queryContractId newObserver verifierConfigCid2
+  updatedConfig.observableView.observers === [user, newObserver]
+
+  -- newObserver can now see the config
+  Some visibleConfig <- queryContractId newObserver verifierConfigCid2
+  Map.size visibleConfig.verifierConfigStateView.verifierStates === 1
+
+  -- newObserver should NOW be able to verify successfully
+  reportData <- submit newObserver $ exerciseCmd newObserverVerifierCid Verify with
+    configCid = verifierConfigCid2
+    signedReportBytes = payload
+    sender = newObserver
+
+  -- Verification succeeds and returns correct data
+  reportData === getReportBytes
+
+-- Test: Verify with real generated report (not fixture data)
+-- Uses actual public keys and report from Chainlink data streams
+testVerifyRealGeneratedReport : Script ()
+testVerifyRealGeneratedReport = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  -- Real report config digest extracted from the actual report
+  let realConfigDigest = "00094baebfda9b87680d8e59aa20a3e565126640ee7caeab3cd965e5568b17ee"
+  
+  -- Real signer addresses (uncompressed public keys) from Chainlink oracles
+  let realSigners = 
+        [ "044286fd69e67bde6ccf36f6a8672a4e878f01f70fc5402cec357585da5633014876741d4ac4987734f0b7c6c94263f7fa287c0fba7e330e3ade57ac3e4411745b"  -- Signer 1
+        , "04f1bd4fc5f60f8f3592efb1ee79943c8f4c72ce43142e6d04f8f36b2cd5e116de9d2b1e3ec01b96266a2b60bb44f246dec534e3a90571c9a213cce091faddbdff"  -- Signer 2
+        , "049205da1b299a62a3097e97bc1b1b8001037686d4c7086205e531ae59cbd885ce96b074b72e218da2636d52c03735e46416d7411e49fa0a00888e8a501e83c578"  -- Signer 3
+        , "0456b872f09ab2b9407eedce5e7f324eda77a5e4774b1473d3a91f1ebf1ee9dda61a6b5253700d861100cd9482c9b7ff6750edf322a04fb1593e5b21d8c76c4eed"  -- Signer 4
+        , "041e57755d724b74a124ba5984b9beeb1ca6bf25a6bfbeb85d3d1217cbbb46a6c88cc03c9edb368f8e875b4c4c43d3de12cf44e7c1c94ff2d57104572fe941c704"  -- Signer 5
+        , "046da2ab10346fde0b4159ba795addb3ad0173f52e442b3e4a127e51fc01feda88969d959413241f475f751fb4496b9c6976b50ab8b5abe41bc6095e5b7e5df600"  -- Signer 6
+        , "04b8d190bc50e9c0d404ad15263dab426733e3f411e9de0be0db032b75d68053a9b526c562614acfd3e50f1074d54986ff167ebc0bfb139a2fa189e0212c257a31"  -- Signer 7
+        , "04e9870d28337c289661f6208e3327afb58d05705af7f584fe281a7d1c752837f498771e264fae1064a7ff65201627f6d53a2a16814f9de3b5140413b50c8416d7"  -- Signer 8
+        , "041fc6da4a5d1774579b4d61e94ef6cdf53fbfd3534fd6906f9530da2ddbccd732f12900f0ee6601a1a8844f9c14e157af5cab709922d77e4896ad2cbe03f44982"  -- Signer 9
+        , "04c540717427f3bf6e64adb6153cfba6bb26a33813beb7975b786a4bf2b8703fa285a11a9820ec8f407809f85db8d7e1d2dc45a8d44c76efcbd06065995f77284a"  -- Signer 10
+        , "04b9369da66fdf7be5ec4fa68fe9bab64aa723a58ee21d4f70b1f813158ffc95bee8a59d78195d810c551c8c1a7f8f4421837ec334bb2ce4b54b999b344217aede"  -- Signer 11
+        , "04c42a8b6c62a293a3d1cd78a289155d9e717189ecb8892f680da72660242b0318abe73ba41cb53c1734130f490be556cbf106a248db12a096495c666e6ef5c999"  -- Signer 12
+        , "0481b24cb5b07d8616e3ace73781bc34ae35781182f6f513b2379b4342e9c6cefc140e193cf60895558568b1059c5d87fe58e14ebc1a326d20835d1142a2f1afa9"  -- Signer 13
+        , "04b0ad7a1bb0a6ae5e2da78c8cd52e85943435dde1f7d8813c48d0f281a93a9eafb944d0752896b2f015d3fde473d1249af7b6d143488af2c0e79d1e64e1bc5e32"  -- Signer 14
+        , "04e5b3224a67b23831609951ed96e12e89ee76749afef837013e900d894ef8d181c9e1da4172d5d6506671758efb0284b67fb23278c50ffbe36130c0094d27f74b"  -- Signer 15
+        , "04f7d31c4a1f220a5d529f3b8ba22cdc5960efa894fa0a5c34f7f332f4f44026f250141aa9ab192d0f7d0447000a1a7ec21b39435eabbe0aff06597a6f11304f15"  -- Signer 16
+        ]
+  
+  -- Setup factory with real config (16 signers, f=5)
+  (factoryCid, verifierConfigCid) <- setupFactoryWithCustomConfig owner realConfigDigest realSigners 5
+    >>= \fCid -> deployUserConfig fCid owner user >>= \uCid -> return (fCid, uCid)
+
+  -- Verify user config was created with correct data
+  Some userConfig <- queryContractId user verifierConfigCid
+  userConfig.confirmedOwnerView.owner === owner
+  userConfig.observableView.observers === [user]
+  Map.size userConfig.verifierConfigStateView.verifierStates === 1
+  
+  case Map.lookup realConfigDigest userConfig.verifierConfigStateView.verifierStates of
+    None -> abort "Real config digest not found in user config"
+    Some state -> do
+      state.f === 5
+      state.isActive === True
+      Map.size state.oracles === 16
+
+  -- Create Verifier contract
+  verifierCid <- createTestVerifier user []
+
+  -- Real full report from Chainlink (contains actual signatures and data)
+  let realFullReport = "00094baebfda9b87680d8e59aa20a3e565126640ee7caeab3cd965e5568b17ee0000000000000000000000000000000000000000000000000000000001728d63000000000000000000000000000000000000000000000000000000040000000100000000000000000000000000000000000000000000000000000000000000e000000000000000000000000000000000000000000000000000000000000002200000000000000000000000000000000000000000000000000000000000000300010001010101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001200003d5a1e39f957e312e307d535c8c28315172442ae0c39d9488e908c3762c85000000000000000000000000000000000000000000000000000000006923c413000000000000000000000000000000000000000000000000000000006923c413000000000000000000000000000000000000000000000000000066443059e485000000000000000000000000000000000000000000000000005970337e5ec69400000000000000000000000000000000000000000000000000000000694b511300000000000000000000000000000000000000000000000004cf48e27cb3055800000000000000000000000000000000000000000000000004cdbb7cdff080b800000000000000000000000000000000000000000000000004d0cb15284242340000000000000000000000000000000000000000000000000000000000000006c217770fa8fe7e0ed4a7989503f3ed69b00a469d1208328589d6f3f6399ab8360582eefb4e6fc3b7c2a00473ae2734ba7705cfbf8635d341082941a5af5b360beae3de88e2cc1e31a7484e1c98ee5d73442ae952e8911f237ec4ab94911cf6db0a141e1623b3b8475003a17d89eea47a0e6d5d0173bf96db9b9b15d53245dea52d381ee7d1731644712e9c45256549eed06a28a2520ba45d4b0eaa0a882462147c02d823bd678bd9ae0c00a5fdcc8e9baa2ff8d6efe7947c2ffa80f906dfd6d00000000000000000000000000000000000000000000000000000000000000006730444d6971be395a3f6b96981ba020dc92c0b915d33462ceb417c40f00394335fcb02c57fdca25720c2594909667a4b923e804044a863ed67a68c00b4a3ad6a2571662dd803f3d002a03def3c54dd446603395b87b0b4b0574d098bab84c46b0f782c1b30eaec9ba633636d45d75c6bd967859ae6fd8e45e405a41ab5b03858231eff72107c3cceca7597914e682a97eda9987ef43fd5d355d66ab50f4ff4d36299c3e765d1fab3b4f1d808e7ad191b09339d98c303e8a57bad330d36eda7b2"
+
+  -- User calls Verify with real generated report
+  reportData <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid
+    signedReportBytes = realFullReport
+    sender = user
+
+  -- Verify that reportData is returned (actual report bytes extraction verified by Verifier logic)
+  reportData =/= ""
+
+-- Test: Old config continues to work after new config is added
+testVerifyOldConfigAfterNewConfigAdded : Script ()
+testVerifyOldConfigAfterNewConfigAdded = script do
+  owner <- allocateParty "Owner"
+  user <- allocateParty "User"
+
+  let configDigest1 = getConfigDigest
+  let configDigest2 = getConfigDigestConfig2
+  let signers1 = take 16 getSignerAddresses
+  let signers2 = take 10 getSignerAddressesConfig2
+
+  -- Setup factory with first config
+  factoryCid1 <- setupFactoryWithCustomConfig owner configDigest1 signers1 5
+
+  -- Deploy user config
+  factoryCid2Interface <- submit owner $ exerciseCmd
+    (toInterfaceContractId @ManagedContractFactory factoryCid1)
+    NewContract with users = [user]
+  
+  let factoryCid2 = fromInterfaceContractId @MasterVerifierConfigFactory factoryCid2Interface
+  
+  -- Query the ledger for the user's VerifierConfig by UUID
+  configs1 <- query @VerifierConfig owner
+  let [(verifierConfigCid1, _)] = filter (\(_, config) -> config.managedContractView.uuid == show user) configs1
+
+  -- Verify initial state has only first config
+  Some userConfig1 <- queryContractId user verifierConfigCid1
+  Map.size userConfig1.verifierConfigStateView.verifierStates === 1
+
+  -- Create Verifier and test first config works
+  verifierCid <- createTestVerifier user []
+  let payload1 = encodePayload (createPayloadFromIndices [0,1,2,3,4,5])
+  reportData1 <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid1
+    signedReportBytes = payload1
+    sender = user
+  reportData1 === getReportBytes
+
+  -- Add second config to factory
+  factoryCid3 <- submit owner $ exerciseCmd factoryCid2 SetViewConfig with
+    configDigest = configDigest2
+    signers = signers2
+    f = 3
+
+  -- Update user's config to receive the new config
+  -- Query ledger for user's current config ContractId
+  userConfigCidBeforeUpdate <- queryVerifierConfigByUuid owner (show user)
+  
+  factoryCid4Interface <- submit owner $ exerciseCmd
+    (toInterfaceContractId @ManagedContractFactory factoryCid3)
+    UpdateContract with contractIds = [toInterfaceContractId @ManagedContract userConfigCidBeforeUpdate]
+
+  let factoryCid4 = fromInterfaceContractId @MasterVerifierConfigFactory factoryCid4Interface
+  
+  -- Query ledger for user's updated config ContractId
+  verifierConfigCid2 <- queryVerifierConfigByUuid owner (show user)
+
+  -- Verify now has both configs
+  Some userConfig2 <- queryContractId user verifierConfigCid2
+  Map.size userConfig2.verifierConfigStateView.verifierStates === 2
+
+  -- Test old config still works
+  reportData2 <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid2
+    signedReportBytes = payload1
+    sender = user
+  reportData2 === getReportBytes
+
+  -- Test new config works
+  let payload2 = encodePayload (createPayloadFromIndicesConfig2 [0,1,2,3])
+  reportData3 <- submit user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid2
+    signedReportBytes = payload2
+    sender = user
+  reportData3 === getReportBytesConfig2
+
+  -- Test wrong signature counts fail for both configs
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid2
+    signedReportBytes = encodePayload (createPayloadFromIndices [0,1,2,3,4])
+    sender = user
+
+  submitMustFail user $ exerciseCmd verifierCid Verify with
+    configCid = verifierConfigCid2
+    signedReportBytes = encodePayload (createPayloadFromIndicesConfig2 [0,1,2])
+    sender = user

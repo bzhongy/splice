@@ -1,0 +1,137 @@
+module Interface.ManagedContractFactory where
+
+import Interface.ManagedContract
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Foldable (forA_)
+import DA.List (dedup, sort)
+
+
+-- View type for the ManagedContractFactory interface
+data ManagedContractFactoryView = ManagedContractFactoryView
+  with
+    contracts : Set Text  -- Set of UUIDs 
+  deriving (Eq, Show)
+
+-- ManagedContractFactory interface for managing user contracts with ownership
+interface ManagedContractFactory where
+  viewtype ManagedContractFactoryView
+
+  -- Abstract method that implementing contracts must provide to update the view
+  updateContractFactory : ManagedContractFactoryView -> Update (ContractId ManagedContractFactory)
+
+  -- Abstract method that implementing contracts must provide to create new ManagedContract
+  newContract : Party -> Text -> Update (ContractId ManagedContract)
+
+  -- Abstract method to create a new contract from an existing one, preserving its data
+  newContractFromExisting : ContractId ManagedContract -> Update (ContractId ManagedContract)
+
+  -- Abstract method to calculate UUID
+  calculateUuid : Party -> Text
+
+  -- Add new contracts for users (owner-only)
+  choice NewContract : ContractId ManagedContractFactory
+    with
+      users : [Party]
+    controller signatory this
+    do
+      let contractFactoryView = view this
+
+      assertMsg "Users list cannot be empty" (not $ null users)
+
+      -- Calculate UUIDs for each user using the abstract method
+      let uuids = map (calculateUuid this) users
+
+      -- Check for duplicate users
+      let sortedUuids = sort uuids
+      let dedupedUuids = dedup sortedUuids
+      assertMsg "Users list contains duplicates" (length sortedUuids == length dedupedUuids)
+
+      -- Check that none of the UUIDs already have contracts
+      let existingUuids = filter (`Set.member` contractFactoryView.contracts) uuids
+      assertMsg ("Users already have contracts: " <> show existingUuids) (null existingUuids)
+
+      -- Create new contracts for all users, passing the calculated UUID
+      let userUuidPairs = zip users uuids
+      _ <- mapA (\(user, uuid) -> newContract this user uuid) userUuidPairs
+
+      -- Update the view with all new UUIDs
+      let updatedContracts = foldl (flip Set.insert) contractFactoryView.contracts uuids
+      let updatedContractFactoryView = contractFactoryView with contracts = updatedContracts
+
+      -- Update the view
+      updateContractFactory this updatedContractFactoryView
+
+  -- Remove contracts by contract IDs
+  choice RemoveContract : ContractId ManagedContractFactory
+    with
+      contractIds : [ContractId ManagedContract]
+    controller signatory this
+    do
+      let contractFactoryView = view this
+
+      assertMsg "Contract IDs list cannot be empty" (not $ null contractIds)
+
+      -- Get UUID from each contract's view
+      uuids <- mapA (\cid -> do
+        managedContract <- fetch (toInterfaceContractId @ManagedContract cid)
+        return (view managedContract).uuid) contractIds
+
+      -- Check for duplicate contract IDs
+      let sortedUuids = sort uuids
+      let dedupedUuids = dedup sortedUuids
+      assertMsg "Contract IDs list contains duplicates" (length sortedUuids == length dedupedUuids)
+
+      -- Check that all UUIDs exist in the set
+      let missingUuids = filter (not . (`Set.member` contractFactoryView.contracts)) uuids
+      assertMsg ("Contracts not found in factory: " <> show missingUuids) (null missingUuids)
+
+      -- Archive all contracts
+      forA_ contractIds archive
+
+      -- Remove all UUIDs from the set
+      let updatedContracts = foldl (flip Set.delete) contractFactoryView.contracts uuids
+      let updatedContractFactoryView = contractFactoryView with contracts = updatedContracts
+
+      -- Update the view
+      updateContractFactory this updatedContractFactoryView
+
+  -- Update contracts by contract IDs with current factory state
+  choice UpdateContract : ContractId ManagedContractFactory
+    with
+      contractIds : [ContractId ManagedContract]
+    controller signatory this
+    do
+      let contractFactoryView = view this
+
+      assertMsg "Contract IDs list cannot be empty" (not $ null contractIds)
+
+      -- Get UUID from each contract's view
+      uuids <- mapA (\cid -> do
+        managedContract <- fetch (toInterfaceContractId @ManagedContract cid)
+        return (view managedContract).uuid) contractIds
+
+      -- Check for duplicate contract IDs
+      let sortedUuids = sort uuids
+      let dedupedUuids = dedup sortedUuids
+      assertMsg "Contract IDs list contains duplicates" (length sortedUuids == length dedupedUuids)
+
+      -- Check that all UUIDs exist in the set
+      let missingUuids = filter (not . (`Set.member` contractFactoryView.contracts)) uuids
+      assertMsg ("Contracts not found in factory: " <> show missingUuids) (null missingUuids)
+
+      -- Create new contracts with preserved data using newContractFromExisting before archiving
+      _ <- mapA (newContractFromExisting this) contractIds
+
+      -- Archive old contracts AFTER creating new ones
+      forA_ contractIds archive
+
+      -- UUIDs remain the same, no need to update the set
+      updateContractFactory this contractFactoryView
+
+  -- Get all managed contract UUIDs
+  nonconsuming choice GetManagedContracts : [Text]
+    with viewer : Party
+    controller viewer
+    do
+      return $ Set.toList (view this).contracts

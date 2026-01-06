@@ -1,0 +1,34 @@
+module Interface.TestTypeAndVersion where
+
+import Interface.TypeAndVersion
+import Daml.Script
+import DA.Assert
+
+-- Test contract implementing TypeAndVersion interface
+template TestTypeAndVersionContract
+  with
+    owner : Party
+    typeAndVersionView : TypeAndVersionView
+  where
+    signatory owner
+
+    interface instance TypeAndVersion for TestTypeAndVersionContract where
+      view = typeAndVersionView
+
+-- Test: GetTypeAndVersion returns the value from the view
+testGetTypeAndVersion : Script ()
+testGetTypeAndVersion = script do
+  alice <- allocateParty "Alice"
+
+  -- Alice creates contract with specific type and version
+  cid <- alice `submit` do
+    createCmd TestTypeAndVersionContract with
+      owner = alice
+      typeAndVersionView = TypeAndVersionView with typeAndVersion = "TestContract 1.0.0"
+
+  -- Alice retrieves the type and version
+  result <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @TypeAndVersion cid) GetTypeAndVersion
+      with viewer = alice
+
+  result === "TestContract 1.0.0"

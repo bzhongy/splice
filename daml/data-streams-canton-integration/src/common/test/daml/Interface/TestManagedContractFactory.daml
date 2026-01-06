@@ -1,0 +1,912 @@
+module Interface.TestManagedContractFactory where
+
+import Interface.ManagedContractFactory
+import Interface.ManagedContract
+import Daml.Script
+import DA.Assert
+import qualified DA.Set as Set
+import DA.List
+
+-- Helper to query MockManagedContract by UUID
+queryMockContractByUuid : Party -> Text -> Script (ContractId MockManagedContract)
+queryMockContractByUuid party uuid = do
+  contracts <- query @MockManagedContract party
+  let [(cid, _)] = filter (\(_, c) -> c.managedContractView.uuid == uuid) contracts
+  return cid
+
+-- Mock ManagedContract template for testing
+template MockManagedContract
+  with
+    owner : Party
+    user : Party
+    configValue : Text  -- Test field to verify view propagation
+    managedContractView : ManagedContractView
+  where
+    signatory owner
+    observer user
+
+    nonconsuming choice Test : Text
+      controller owner
+      do
+        return "Test successful"
+
+    nonconsuming choice GetConfigValue : Text
+      controller user
+      do
+        return configValue
+
+    interface instance ManagedContract for MockManagedContract where
+      view = managedContractView
+
+-- Test template implementing ManagedContractFactory interface
+template TestManagedContractFactory
+  with
+    owner : Party
+    observers : [Party]
+    managedContractFactoryView : ManagedContractFactoryView
+    configValue : Text
+  where
+    signatory owner
+    observer observers
+
+    interface instance ManagedContractFactory for TestManagedContractFactory where
+      view = managedContractFactoryView
+      updateContractFactory newManagedContractFactoryView = do
+        contractId <- create this with managedContractFactoryView = newManagedContractFactoryView
+        return (toInterfaceContractId @ManagedContractFactory contractId)
+      newContract user userUuid = do
+        contractId <- create MockManagedContract with
+          owner = owner
+          user = user
+          configValue = configValue
+          managedContractView = ManagedContractView with
+            uuid = userUuid
+            user = user
+        return (toInterfaceContractId @ManagedContract contractId)
+        
+      newContractFromExisting existingContractId = do
+        -- Fetch the existing MockManagedContract
+        existingContract <- fetch (fromInterfaceContractId @MockManagedContract existingContractId)
+        
+        -- Create new contract with existing user data but current factory configValue
+        newContractId <- create MockManagedContract with
+          owner = owner
+          user = existingContract.user
+          configValue = configValue  -- Use factory's current configValue
+          managedContractView = existingContract.managedContractView  -- Preserve the existing view
+        
+        return (toInterfaceContractId @ManagedContract newContractId)
+      calculateUuid party = show party
+
+    choice UpdateTestConfig : ContractId TestManagedContractFactory
+      with
+        newConfigValue : Text
+      controller owner
+      do
+        create this with configValue = newConfigValue
+
+
+-- Test: New contract is created and has been added to the contracts list within the view
+testNewContract : Script ()
+testNewContract = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob as a new user
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob]
+
+  -- Verify Bob was added to the contracts list
+  uuids <- alice `submit` do
+    exerciseCmd newCid GetManagedContracts with viewer = alice
+
+  length uuids === 1
+  let uuid = head uuids
+  uuid === show bob
+
+  -- Query the ledger for Bob's contract and call Test on it
+  bobContractId <- queryMockContractByUuid alice (show bob)
+  result <- alice `submit` do
+    exerciseCmd bobContractId Test
+
+  result === "Test successful"
+
+-- Test: Only owner can add new contracts (calling with non-owner should fail)
+testOnlyOwnerCanAddNewContract : Script ()
+testOnlyOwnerCanAddNewContract = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = [bob]
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Bob (non-owner) attempts to add Charlie - should fail (not a signatory)
+  submitMustFail bob do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [charlie]
+
+-- Test: New contract user list must not be empty
+testNewContractUserListMustNotBeEmpty : Script ()
+testNewContractUserListMustNotBeEmpty = script do
+  alice <- allocateParty "Alice"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice attempts to add empty user list - should fail
+  submitMustFail alice do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = []
+
+-- Test: New contract user must not already be registered
+testNewContractUserMustNotAlreadyBeRegistered : Script ()
+testNewContractUserMustNotAlreadyBeRegistered = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob first time - should succeed
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob]
+
+  -- Alice attempts to add Bob again - should fail
+  submitMustFail alice do
+    exerciseCmd newCid NewContract
+      with users = [bob]
+
+-- Test: New contract fails with duplicate users in list
+testNewContractFailsWithDuplicates : Script ()
+testNewContractFailsWithDuplicates = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice attempts to add Bob twice in same call - should fail
+  submitMustFail alice do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob, bob]
+
+-- Test: New contract for previously removed user
+testNewContractForPreviouslyRemovedUser : Script ()
+testNewContractForPreviouslyRemovedUser = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob
+  newCid1 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob]
+
+  -- Get Bob's contract ID by querying the ledger
+  bobContractId1 <- queryMockContractByUuid alice (show bob)
+
+  -- Alice removes Bob
+  newCid2 <- alice `submit` do
+    exerciseCmd newCid1 RemoveContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobContractId1]
+
+  -- Alice adds Bob again
+  newCid3 <- alice `submit` do
+    exerciseCmd newCid2 NewContract
+      with users = [bob]
+
+  -- Verify Bob is back in the contracts list
+  uuids <- alice `submit` do
+    exerciseCmd newCid3 GetManagedContracts with viewer = alice
+
+  length uuids === 1
+  head uuids === show bob
+
+-- Test: Remove contract (check contract is archived and user is removed from the list)
+testRemoveContract : Script ()
+testRemoveContract = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob
+  newCid1 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob]
+
+  -- Verify Bob is in the list
+  uuidsBefore <- alice `submit` do
+    exerciseCmd newCid1 GetManagedContracts with viewer = alice
+
+  length uuidsBefore === 1
+
+  -- Query Bob's contract and call Test on it
+  bobContractId <- queryMockContractByUuid alice (show bob)
+  result <- alice `submit` do
+    exerciseCmd bobContractId Test
+
+  result === "Test successful"
+
+  -- Alice removes Bob
+  newCid2 <- alice `submit` do
+    exerciseCmd newCid1 RemoveContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobContractId]
+
+  -- Verify Bob is removed from the list
+  uuidsAfter <- alice `submit` do
+    exerciseCmd newCid2 GetManagedContracts with viewer = alice
+
+  assert (null uuidsAfter)
+
+  -- Verify Bob's contract is archived - attempting to call Test should fail
+  submitMustFail alice do
+    exerciseCmd bobContractId Test
+
+-- Test: Only owner can remove contracts
+testOnlyOwnerCanRemoveContract : Script ()
+testOnlyOwnerCanRemoveContract = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = [bob]
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Charlie
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [charlie]
+
+  -- Get Charlie's contract ID by querying the ledger
+  charlieContractId <- queryMockContractByUuid alice (show charlie)
+
+  -- Bob (non-owner) attempts to remove Charlie - should fail (not a signatory)
+  submitMustFail bob do
+    exerciseCmd newCid RemoveContract
+      with contractIds = [toInterfaceContractId @ManagedContract charlieContractId]
+
+-- Test: Remove contract user list must not be empty
+testRemoveContractUserListMustNotBeEmpty : Script ()
+testRemoveContractUserListMustNotBeEmpty = script do
+  alice <- allocateParty "Alice"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice attempts to remove empty contract list
+  submitMustFail alice do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) RemoveContract
+      with contractIds = []
+
+-- Test: Remove contract user must be registered
+testRemoveContractUserMustBeRegistered : Script ()
+testRemoveContractUserMustBeRegistered = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Create a contract that's NOT managed by the factory
+  unmanagedContract <- alice `submit` do
+    createCmd MockManagedContract with
+      owner = alice
+      user = bob
+      configValue = "unmanaged"
+      managedContractView = ManagedContractView with
+        uuid = show bob
+        user = bob
+
+  -- Alice attempts to remove contract that was never added to factory - should fail
+  submitMustFail alice do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) RemoveContract
+      with contractIds = [toInterfaceContractId @ManagedContract unmanagedContract]
+
+-- Test: Remove contract fails with duplicate users in list
+testRemoveContractFailsWithDuplicates : Script ()
+testRemoveContractFailsWithDuplicates = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob]
+
+  -- Get Bob's contract ID by querying the ledger
+  bobContractId <- queryMockContractByUuid alice (show bob)
+
+  -- Alice attempts to remove Bob twice in same call - should fail
+  submitMustFail alice do
+    exerciseCmd newCid RemoveContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobContractId, toInterfaceContractId @ManagedContract bobContractId]
+
+-- Test: Remove contract for previously removed and added user
+testRemoveContractForPreviouslyRemovedAndAddedUser : Script ()
+testRemoveContractForPreviouslyRemovedAndAddedUser = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob and Charlie
+  newCid1 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob, charlie]
+
+  -- Get Bob's contract ID by querying the ledger
+  bobContractId1 <- queryMockContractByUuid alice (show bob)
+
+  -- Alice removes Bob
+  newCid2 <- alice `submit` do
+    exerciseCmd newCid1 RemoveContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobContractId1]
+
+  -- Alice adds Bob back
+  newCid3 <- alice `submit` do
+    exerciseCmd newCid2 NewContract
+      with users = [bob]
+
+  -- Get Bob's new contract ID by querying the ledger
+  bobContractId2 <- queryMockContractByUuid alice (show bob)
+
+  -- Alice removes Bob again
+  newCid4 <- alice `submit` do
+    exerciseCmd newCid3 RemoveContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobContractId2]
+
+  -- Verify only Charlie remains
+  uuids <- alice `submit` do
+    exerciseCmd newCid4 GetManagedContracts with viewer = alice
+
+  length uuids === 1
+  head uuids === show charlie
+
+-- Test: New contract with multiple users at once (batch operation)
+testNewContractWithMultiUser : Script ()
+testNewContractWithMultiUser = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  dave <- allocateParty "Dave"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds three users at once
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob, charlie, dave]
+
+  -- Verify all three users were added to the contracts list
+  uuids <- alice `submit` do
+    exerciseCmd newCid GetManagedContracts with viewer = alice
+
+  length uuids === 3
+
+  -- Verify each contract is active by calling Test
+  -- Query each user's contract from the ledger
+  bobCid <- queryMockContractByUuid alice (show bob)
+  charlieCid <- queryMockContractByUuid alice (show charlie)
+  daveCid <- queryMockContractByUuid alice (show dave)
+
+  results <- alice `submit` do
+    forA [bobCid, charlieCid, daveCid] $ \mockContractId ->
+      exerciseCmd mockContractId Test
+
+  -- All three tests should succeed
+  assert (all (== "Test successful") results)
+
+-- Test: Remove contracts with multiple users at once (batch operation)
+testRemoveContractsWithMultiUser : Script ()
+testRemoveContractsWithMultiUser = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  dave <- allocateParty "Dave"
+  eve <- allocateParty "Eve"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds four users
+  newCid1 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob, charlie, dave, eve]
+
+  -- Verify all four users were added
+  uuidsBefore <- alice `submit` do
+    exerciseCmd newCid1 GetManagedContracts with viewer = alice
+
+  length uuidsBefore === 4
+
+  -- Get contract IDs by querying the ledger
+  bobContractId <- queryMockContractByUuid alice (show bob)
+  daveContractId <- queryMockContractByUuid alice (show dave)
+  charlieContractId <- queryMockContractByUuid alice (show charlie)
+  eveContractId <- queryMockContractByUuid alice (show eve)
+
+  -- Alice removes Bob and Dave (two users at once)
+  newCid2 <- alice `submit` do
+    exerciseCmd newCid1 RemoveContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobContractId, toInterfaceContractId @ManagedContract daveContractId]
+
+  -- Verify only Charlie and Eve remain
+  uuidsAfter <- alice `submit` do
+    exerciseCmd newCid2 GetManagedContracts with viewer = alice
+
+  length uuidsAfter === 2
+
+  assert (show charlie `elem` uuidsAfter)
+  assert (show eve `elem` uuidsAfter)
+  assert (show bob `notElem` uuidsAfter)
+  assert (show dave `notElem` uuidsAfter)
+
+  -- Verify Bob's and Dave's contracts are archived (should fail)
+  submitMustFail alice do
+    exerciseCmd bobContractId Test
+
+  submitMustFail alice do
+    exerciseCmd daveContractId Test
+
+  -- Verify Charlie's and Eve's contracts are still active
+  result1 <- alice `submit` do
+    exerciseCmd charlieContractId Test
+
+  result2 <- alice `submit` do
+    exerciseCmd eveContractId Test
+
+  result1 === "Test successful"
+  result2 === "Test successful"
+
+-- Test: Remove contract with multiple users and one missing user (should fail atomically)
+testRemoveContractWithMultiUserAndOneMisingUser : Script ()
+testRemoveContractWithMultiUserAndOneMisingUser = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  dave <- allocateParty "Dave"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob and Charlie (Dave is never added)
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob, charlie]
+
+  -- Verify Bob and Charlie were added
+  uuidsBefore <- alice `submit` do
+    exerciseCmd newCid GetManagedContracts with viewer = alice
+
+  length uuidsBefore === 2
+
+  -- Query contracts from ledger
+  bobContractId <- queryMockContractByUuid alice (show bob)
+  charlieContractId <- queryMockContractByUuid alice (show charlie)
+
+  -- Create an unmanaged contract for Dave
+  daveUnmanagedContract <- alice `submit` do
+    createCmd MockManagedContract with
+      owner = alice
+      user = dave
+      configValue = "unmanaged"
+      managedContractView = ManagedContractView with
+        uuid = show dave
+        user = dave
+
+  -- Alice attempts to remove Bob, Dave, and Charlie (Dave doesn't exist in factory)
+  -- This should fail with error message about missing users
+  submitMustFail alice do
+    exerciseCmd newCid RemoveContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobContractId, toInterfaceContractId @ManagedContract daveUnmanagedContract, toInterfaceContractId @ManagedContract charlieContractId]
+
+  -- Verify Bob and Charlie's contracts remain active (no partial removal)
+  result1 <- alice `submit` do
+    exerciseCmd bobContractId Test
+
+  result2 <- alice `submit` do
+    exerciseCmd charlieContractId Test
+
+  result1 === "Test successful"
+  result2 === "Test successful"
+
+  -- Verify the contracts set still has both users
+  uuidsAfter <- alice `submit` do
+    exerciseCmd newCid GetManagedContracts with viewer = alice
+
+  length uuidsAfter === 2
+
+-- Test: Update contract (check old contract is archived, new contract is created, and view changes propagate)
+testUpdateContract : Script ()
+testUpdateContract = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob
+  newCid1 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob]
+
+  -- Get Bob's original contract ID by querying ledger
+  bobOriginalContractId <- queryMockContractByUuid alice (show bob)
+
+  -- Verify Bob's original contract has v1 config
+  configV1 <- bob `submit` do
+    exerciseCmd bobOriginalContractId GetConfigValue
+
+  configV1 === "config-v1"
+
+  -- Alice updates the factory's config value
+  newCid1Updated <- alice `submit` do
+    let factoryCid = fromInterfaceContractId @TestManagedContractFactory newCid1
+    exerciseCmd factoryCid UpdateTestConfig with newConfigValue = "config-v2"
+
+  -- Alice updates Bob's contract (should get new config)
+  newCid2 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory newCid1Updated) UpdateContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobOriginalContractId]
+
+  -- Get Bob's new contract ID by querying ledger
+  bobNewContractId <- queryMockContractByUuid alice (show bob)
+
+  -- Verify the contract ID changed
+  assert (bobOriginalContractId /= bobNewContractId)
+
+  -- Verify Bob's original contract is archived
+  submitMustFail alice do
+    exerciseCmd bobOriginalContractId Test
+
+  -- Verify Bob's new contract is active and has the updated config value
+  result <- alice `submit` do
+    exerciseCmd bobNewContractId Test
+
+  result === "Test successful"
+
+  -- Verify Bob's new contract has v2 config 
+  configV2 <- bob `submit` do
+    exerciseCmd bobNewContractId GetConfigValue
+
+  configV2 === "config-v2"
+
+-- Test: Only owner can update contracts
+testUpdateContractFailsWithNonOwner : Script ()
+testUpdateContractFailsWithNonOwner = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = [bob]
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Charlie
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [charlie]
+
+  -- Get Charlie's contract ID by querying ledger
+  charlieContractId <- queryMockContractByUuid alice (show charlie)
+
+  -- Bob (non-owner) attempts to update Charlie's contract - should fail
+  submitMustFail bob do
+    exerciseCmd newCid UpdateContract
+      with contractIds = [toInterfaceContractId @ManagedContract charlieContractId]
+
+-- Test: Update contract user list must not be empty
+testUpdateContractFailsWithNoUsers : Script ()
+testUpdateContractFailsWithNoUsers = script do
+  alice <- allocateParty "Alice"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice attempts to update with empty contract list
+  submitMustFail alice do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) UpdateContract
+      with contractIds = []
+
+-- Test: Update contract fails with duplicate users in list
+testUpdateContractFailsWithDuplicates : Script ()
+testUpdateContractFailsWithDuplicates = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob]
+
+  -- Get Bob's contract ID by querying ledger
+  bobContractId <- queryMockContractByUuid alice (show bob)
+
+  -- Alice attempts to update with Bob's contract listed twice - should fail
+  submitMustFail alice do
+    exerciseCmd newCid UpdateContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobContractId, toInterfaceContractId @ManagedContract bobContractId]
+
+
+-- Test: Update contracts for multiple users at once
+testUpdateContractForMultipleUsers : Script ()
+testUpdateContractForMultipleUsers = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  dave <- allocateParty "Dave"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds three users
+  newCid1 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob, charlie, dave]
+
+  -- Get original contract IDs by querying ledger
+  bobOriginalContractId <- queryMockContractByUuid alice (show bob)
+  charlieOriginalContractId <- queryMockContractByUuid alice (show charlie)
+  daveContractId <- queryMockContractByUuid alice (show dave)
+
+  -- Alice updates Bob and Charlie's contracts (not Dave)
+  newCid2 <- alice `submit` do
+    exerciseCmd newCid1 UpdateContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobOriginalContractId, toInterfaceContractId @ManagedContract charlieOriginalContractId]
+
+  -- Get updated contract IDs by querying ledger
+  bobNewContractId <- queryMockContractByUuid alice (show bob)
+  charlieNewContractId <- queryMockContractByUuid alice (show charlie)
+
+  -- Verify Bob and Charlie's contract IDs changed
+  assert (bobOriginalContractId /= bobNewContractId)
+  assert (charlieOriginalContractId /= charlieNewContractId)
+
+  -- Verify Bob's and Charlie's original contracts are archived
+  submitMustFail alice do
+    exerciseCmd bobOriginalContractId Test
+
+  submitMustFail alice do
+    exerciseCmd charlieOriginalContractId Test
+
+  -- Verify Bob's and Charlie's new contracts are active
+  result1 <- alice `submit` do
+    exerciseCmd bobNewContractId Test
+
+  result2 <- alice `submit` do
+    exerciseCmd charlieNewContractId Test
+
+  result1 === "Test successful"
+  result2 === "Test successful"
+
+  -- Verify Dave's contract is still active (unchanged)
+  result3 <- alice `submit` do
+    exerciseCmd daveContractId Test
+
+  result3 === "Test successful"
+
+-- Test: Update contract fails for user without existing contract
+testUpdateContractFailsForInvalidUser : Script ()
+testUpdateContractFailsForInvalidUser = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob (Charlie is never added)
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob]
+
+  -- Create an unmanaged contract for Charlie
+  charlieUnmanagedContract <- alice `submit` do
+    createCmd MockManagedContract with
+      owner = alice
+      user = charlie
+      configValue = "unmanaged"
+      managedContractView = ManagedContractView with
+        uuid = show charlie
+        user = charlie
+
+  -- Alice attempts to update Charlie (who doesn't have a contract in factory) - should fail
+  submitMustFail alice do
+    exerciseCmd newCid UpdateContract
+      with contractIds = [toInterfaceContractId @ManagedContract charlieUnmanagedContract]
+
+-- Test: Update contract twice for one user (second update should work on new contract)
+testUpdateContractTwiceForOneUser : Script ()
+testUpdateContractTwiceForOneUser = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = []
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Bob
+  newCid1 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [bob]
+
+  -- Get Bob's original contract ID by querying ledger
+  bobContractId1 <- queryMockContractByUuid alice (show bob)
+
+  -- Alice updates Bob's contract (first time)
+  newCid2 <- alice `submit` do
+    exerciseCmd newCid1 UpdateContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobContractId1]
+
+  -- Get Bob's second contract ID by querying ledger
+  bobContractId2 <- queryMockContractByUuid alice (show bob)
+
+  -- Verify contract ID changed
+  assert (bobContractId1 /= bobContractId2)
+
+  -- Alice updates Bob's contract (second time)
+  newCid3 <- alice `submit` do
+    exerciseCmd newCid2 UpdateContract
+      with contractIds = [toInterfaceContractId @ManagedContract bobContractId2]
+
+  -- Get Bob's third contract ID by querying ledger
+  bobContractId3 <- queryMockContractByUuid alice (show bob)
+
+  -- Verify all three contract IDs are different
+  assert (bobContractId1 /= bobContractId2)
+  assert (bobContractId2 /= bobContractId3)
+  assert (bobContractId1 /= bobContractId3)
+
+  -- Verify only the latest contract is active
+  submitMustFail alice do
+    exerciseCmd bobContractId1 Test
+
+  submitMustFail alice do
+    exerciseCmd bobContractId2 Test
+
+  result <- alice `submit` do
+    exerciseCmd bobContractId3 Test
+
+  result === "Test successful"
+
+-- Test: Query authorization for GetManagedContracts from different parties
+testGetManagedContractsQueryAuth : Script ()
+testGetManagedContractsQueryAuth = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  dave <- allocateParty "Dave"
+
+  cid <- alice `submit` do
+    createCmd TestManagedContractFactory with
+      owner = alice
+      observers = [bob]
+      managedContractFactoryView = ManagedContractFactoryView with contracts = Set.empty
+      configValue = "config-v1"
+
+  -- Alice adds Charlie as a user (not observer)
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @ManagedContractFactory cid) NewContract
+      with users = [charlie]
+
+  -- Alice (owner) can query GetManagedContracts
+  uuidsFromAlice <- alice `submit` do
+    exerciseCmd newCid GetManagedContracts with viewer = alice
+
+  length uuidsFromAlice === 1
+  head uuidsFromAlice === show charlie
+
+  -- Bob (observer) can query GetManagedContracts
+  uuidsFromBob <- bob `submit` do
+    exerciseCmd newCid GetManagedContracts with viewer = bob
+
+  length uuidsFromBob === 1
+
+  -- Dave (non-observer) cannot query GetManagedContracts - should fail
+  submitMustFail dave do
+    exerciseCmd newCid GetManagedContracts with viewer = dave

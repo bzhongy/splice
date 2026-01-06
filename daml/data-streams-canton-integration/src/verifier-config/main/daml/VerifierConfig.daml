@@ -1,0 +1,50 @@
+module VerifierConfig where
+
+import Types.VerifierConfigState
+import Interface.ManagedContract
+import Interface.TypeAndVersion
+import Interface.ConfirmedOwner
+import Interface.Observable
+import DA.List (head)
+
+-- | VerifierConfig contract - holds configuration state for a user
+-- | Managed by MasterVerifierConfigFactory owner
+-- | Observable by user for verification
+template VerifierConfig
+  with
+    confirmedOwnerView : ConfirmedOwnerView
+    observableView : ObservableView
+    verifierConfigStateView : VerifierConfigStateView
+    managedContractView : ManagedContractView
+  where
+    signatory confirmedOwnerView.owner
+    observer observableView.observers
+    
+    -- The user of this managed contract must be the first observer
+    ensure head observableView.observers == managedContractView.user
+
+    -- | Implements the ManagedContract interface
+    interface instance ManagedContract for VerifierConfig where
+      view = managedContractView
+
+    -- | Implements the TypeAndVersion interface
+    interface instance TypeAndVersion for VerifierConfig where
+      view = TypeAndVersionView with typeAndVersion = "VerifierConfig:1.0.0"
+
+    -- | Implements the ConfirmedOwner interface
+    interface instance ConfirmedOwner for VerifierConfig where
+      view = confirmedOwnerView
+
+      -- Updates the confirmed owner view
+      updateConfirmedOwner newConfirmedOwnerView = do
+        contractId <- create this with confirmedOwnerView = newConfirmedOwnerView
+        return (toInterfaceContractId @ConfirmedOwner contractId)
+
+    -- | Implements the Observable interface
+    interface instance Observable for VerifierConfig where
+      view = observableView
+
+      -- Updates the observable view
+      updateObservable newObservableView = do
+        contractId <- create this with observableView = newObservableView
+        return (toInterfaceContractId @Observable contractId)

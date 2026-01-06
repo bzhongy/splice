@@ -1,0 +1,189 @@
+module MasterVerifierConfigFactory where
+
+import Interface.ManagedContractFactory
+import Interface.ConfirmedOwner
+import Interface.Observable
+import Interface.ManagedContract
+import Interface.TypeAndVersion
+import Types.VerifierConfigState
+import VerifierConfig
+import DA.Map ()
+import qualified DA.Map as Map
+import DA.Foldable (mapA_)
+import qualified DA.Text as Text
+import DA.Crypto.Text (BytesHex, byteCount)
+import Util.Hex (stripHexPrefix)
+
+-- OCR standard maximum number of oracles
+maxNumOracles : Int
+maxNumOracles = 31
+
+-- MasterVerifierConfigFactory for managing VerifierConfig contracts for users
+template MasterVerifierConfigFactory
+  with
+    confirmedOwnerView : ConfirmedOwnerView
+    observableView : ObservableView
+    managedContractFactoryView : ManagedContractFactoryView
+    verifierConfigStateView : VerifierConfigStateView
+  where
+    signatory confirmedOwnerView.owner
+    observer observableView.observers
+
+    -- Implements the ConfirmedOwner interface
+    interface instance ConfirmedOwner for MasterVerifierConfigFactory where
+      view = confirmedOwnerView
+
+      -- Updates the confirmed owner view
+      updateConfirmedOwner newConfirmedOwnerView = do
+        contractId <- create this with confirmedOwnerView = newConfirmedOwnerView
+        return (toInterfaceContractId @ConfirmedOwner contractId)
+
+    -- Implements the Observable interface
+    interface instance Observable for MasterVerifierConfigFactory where
+      view = observableView
+
+      -- Updates the observable view
+      updateObservable newObservableView = do
+        contractId <- create this with observableView = newObservableView
+        return (toInterfaceContractId @Observable contractId)
+
+    -- | Implements the ManagedContractFactory interface
+    interface instance ManagedContractFactory for MasterVerifierConfigFactory where
+      view = managedContractFactoryView
+
+      -- Updates the managed contract factory view
+      updateContractFactory newManagedContractFactoryView = do
+        contractId <- create this with managedContractFactoryView = newManagedContractFactoryView
+        return (toInterfaceContractId @ManagedContractFactory contractId)
+
+      -- Calculate UUID from a Party
+      calculateUuid party = show party
+
+      -- Create a new managed VerifierConfig contract for user
+      newContract user userUuid = do
+        configCid <- create VerifierConfig with
+          confirmedOwnerView = ConfirmedOwnerView with
+            owner = confirmedOwnerView.owner
+            pendingOwner = None
+          observableView = ObservableView with
+            observers = [user]
+          verifierConfigStateView = verifierConfigStateView
+          managedContractView = ManagedContractView with
+            uuid = userUuid
+            user = user
+        return (toInterfaceContractId @ManagedContract configCid)
+
+      -- Create a new contract from existing, preserving user data but updating verifierConfigStateView
+      newContractFromExisting existingContractId = do
+        -- Fetch the existing VerifierConfig
+        existingConfig <- fetch (fromInterfaceContractId @VerifierConfig existingContractId)
+        
+        -- Create new contract with existing user data but current factory state
+        newConfigCid <- create VerifierConfig with
+          confirmedOwnerView = existingConfig.confirmedOwnerView
+          observableView = existingConfig.observableView
+          verifierConfigStateView = verifierConfigStateView  -- Use factory's current state
+          managedContractView = existingConfig.managedContractView
+        
+        return (toInterfaceContractId @ManagedContract newConfigCid)
+
+
+    -- Implements the TypeAndVersion interface
+    interface instance TypeAndVersion for MasterVerifierConfigFactory where
+      view = TypeAndVersionView with typeAndVersion = "MasterVerifierConfigFactory:1.0.0"
+
+    -- Sets configuration for a config digest in the internal VerifierConfigView
+    choice SetViewConfig : ContractId MasterVerifierConfigFactory
+      with
+        configDigest : BytesHex
+        signers : [BytesHex]
+        f : Int
+      controller confirmedOwnerView.owner
+      do
+        -- Strip 0x prefix from config digest and signers if present
+        let cleanConfigDigest = stripHexPrefix configDigest
+        let cleanSigners = map stripHexPrefix signers
+
+        -- Validate config digest length (32 bytes)
+        assertMsg "InvalidConfigDigestLength" (byteCount cleanConfigDigest == 32)
+
+        let numSigners = length cleanSigners
+
+        -- Validate number of signers
+        assertMsg ("ExcessSigners: " <> show numSigners <> " > " <> show maxNumOracles)
+          (numSigners <= maxNumOracles)
+        assertMsg ("InsufficientSigners: " <> show numSigners <> " <= " <> show (3 * f))
+          (numSigners > 3 * f)
+
+        -- Validate public key format (uncompressed secp256k1: 0x04 prefix + 64 bytes)
+        mapA_ (\pubKey -> assertMsg "InvalidPublicKeyLength" (byteCount pubKey == 65)) cleanSigners
+        mapA_ (\pubKey -> assertMsg "InvalidPublicKeyFormat" (Text.take 2 pubKey == "04")) cleanSigners
+
+        -- Validate fault tolerance
+        assertMsg "FaultToleranceMustBePositive" (f > 0)
+
+        let newOracles = Map.fromList $ map (\pubKey -> (pubKey, 1)) cleanSigners
+
+        -- Check for duplicate signers (if map size != list size, there were duplicates)
+        assertMsg "NonUniqueSignatures" (Map.size newOracles == numSigners)
+
+        -- Get current ledger time
+        currentTime <- getTime
+
+        -- Create new verifier config
+        let newState = VerifierConfigDigest with
+              latestConfigTime = currentTime
+              isActive = True
+              f = f
+              oracles = newOracles
+
+        let updatedStates = Map.insert cleanConfigDigest newState verifierConfigStateView.verifierStates
+        let updatedVerifierConfigStateView = verifierConfigStateView with verifierStates = updatedStates
+
+        -- Archive and recreate factory with updated config
+        create this with verifierConfigStateView = updatedVerifierConfigStateView
+
+    -- Activates a config digest in the internal VerifierConfigStateView
+    choice ActivateViewConfig : ContractId MasterVerifierConfigFactory
+      with
+        configDigest : BytesHex
+      controller confirmedOwnerView.owner
+      do
+        -- Normalize config digest (strip 0x prefix if present)
+        let cleanConfigDigest = stripHexPrefix configDigest
+        
+        -- Lookup the config
+        case Map.lookup cleanConfigDigest verifierConfigStateView.verifierStates of
+          None -> error ("DigestNotSet: " <> cleanConfigDigest)
+          Some state -> do
+            -- Update the state to active
+            let updatedState = state with isActive = True
+            let updatedStates = Map.insert cleanConfigDigest updatedState verifierConfigStateView.verifierStates
+            let updatedVerifierConfigStateView = verifierConfigStateView with verifierStates = updatedStates
+
+            -- Archive and recreate factory with activated config
+            create this with verifierConfigStateView = updatedVerifierConfigStateView
+
+    -- Deactivates a config digest (only updates local state)
+    choice DeactivateViewConfig : ContractId MasterVerifierConfigFactory
+      with
+        configDigest : BytesHex
+      controller confirmedOwnerView.owner
+      do
+        -- Normalize config digest (strip 0x prefix if present)
+        let cleanConfigDigest = stripHexPrefix configDigest
+        
+        -- Lookup the config
+        case Map.lookup cleanConfigDigest verifierConfigStateView.verifierStates of
+          None -> error ("DigestNotSet: " <> cleanConfigDigest)
+          Some state -> do
+            -- Update the state to inactive
+            let updatedState = state with isActive = False
+            let updatedStates = Map.insert cleanConfigDigest updatedState verifierConfigStateView.verifierStates
+            let updatedVerifierConfigStateView = verifierConfigStateView with verifierStates = updatedStates
+
+            -- Archive and recreate factory with deactivated config
+            create this with verifierConfigStateView = updatedVerifierConfigStateView
+
+
+

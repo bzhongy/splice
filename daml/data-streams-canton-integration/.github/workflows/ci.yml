@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build-test-lint:
+    name: "[REQUIRED] Build, Test & Lint"
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        
+    - name: Install Daml SDK
+      run: |
+        curl -sSL https://get.daml.com/ | sh
+        export PATH="$HOME/.daml/bin:$PATH"
+        daml install 3.4.9
+        echo "$HOME/.daml/sdk/3.4.9/daml" >> $GITHUB_PATH
+
+    - name: Verify Daml installation
+      run: daml version
+          
+    - name: Build DAML project
+      run: make build
+        
+    - name: Run DAML tests
+      run: make test
+
+    - name: Run DAML linter
+      run: make lint

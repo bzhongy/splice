@@ -1,0 +1,18 @@
+module Interface.TypeAndVersion where
+
+-- View type for the TypeAndVersion interface
+data TypeAndVersionView = TypeAndVersionView
+  with
+    typeAndVersion : Text
+  deriving (Eq, Show)
+
+-- TypeAndVersion interface for identifying contract types and versions
+interface TypeAndVersion where
+  viewtype TypeAndVersionView
+
+  -- Get the type and version string for this contract
+  nonconsuming choice GetTypeAndVersion : Text
+    with viewer : Party
+    controller viewer
+    do
+      return (view this).typeAndVersion

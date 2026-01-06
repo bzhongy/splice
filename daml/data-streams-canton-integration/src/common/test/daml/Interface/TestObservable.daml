@@ -1,0 +1,356 @@
+module Interface.TestObservable where
+
+import Interface.Observable
+import Daml.Script
+import DA.Assert
+
+-- Test contract implementing Observable interface
+template TestObservableContract
+  with
+    owner : Party
+    observableView : ObservableView
+  where
+    signatory owner
+    observer observableView.observers
+   
+    interface instance Observable for TestObservableContract where
+      view = observableView
+      updateObservable newObservableView = do
+        contractId <- create this with observableView = newObservableView
+        return (toInterfaceContractId @Observable contractId)
+
+-- Test: Owner can add observer to contract
+testAddObserverAsSignatory : Script ()
+testAddObserverAsSignatory = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  
+  -- Alice creates contract with no observers
+  cid <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = []
+  
+  -- Alice (owner/signatory) adds Bob as observer
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @Observable cid) AddObserver
+      with newObserver = bob
+  
+  -- Verify Bob was added as observer
+  observers <- alice `submit` do
+    exerciseCmd newCid GetObservers with viewer = alice
+  
+  observers === [bob]
+
+-- Test: Non-owner cannot add observers (authorization check)
+testAddObserverAsNonSignatory : Script ()
+testAddObserverAsNonSignatory = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  
+  -- Alice creates contract with Bob as observer
+  cid <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = [bob]
+  
+  -- Bob (non-owner) attempting to add Charlie should fail (not a signatory)
+  submitMustFail bob do
+    exerciseCmd (toInterfaceContractId @Observable cid) AddObserver
+      with newObserver = charlie
+
+-- Test: Owner can remove observer from contract
+testRemoveObserverAsSignatory : Script ()
+testRemoveObserverAsSignatory = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  
+  -- Alice creates contract with Bob as observer
+  cid <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = [bob]
+  
+  -- Alice (owner/signatory) removes Bob
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @Observable cid) RemoveObserver
+      with observerToRemove = bob
+  
+  -- Verify Bob was removed
+  observers <- alice `submit` do
+    exerciseCmd newCid GetObservers with viewer = alice
+  
+  assert (null observers)
+
+-- Test: Non-owner cannot remove observers (authorization check)
+testRemoveObserverAsNonSignatory : Script ()
+testRemoveObserverAsNonSignatory = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  
+  -- Alice creates contract with Bob and Charlie as observers
+  cid <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = [bob, charlie]
+  
+  -- Bob (non-owner) attempting to remove Charlie should fail (not a signatory)
+  submitMustFail bob do
+    exerciseCmd (toInterfaceContractId @Observable cid) RemoveObserver
+      with observerToRemove = charlie
+
+-- Test: Cannot add duplicate observer
+testAddDuplicateObserver : Script ()
+testAddDuplicateObserver = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  
+  -- Alice creates contract with Bob as observer
+  cid <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = [bob]
+  
+  -- Alice attempts to add Bob again (should fail)
+  submitMustFail alice do
+    exerciseCmd (toInterfaceContractId @Observable cid) AddObserver
+      with newObserver = bob
+
+-- Test: Cannot add signatory as observer
+testAddSignatoryAsObserver : Script ()
+testAddSignatoryAsObserver = script do
+  alice <- allocateParty "Alice"
+  
+  -- Alice creates contract with no observers
+  cid <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = []
+  
+  -- Alice attempts to add herself (signatory) as observer (should fail)
+  submitMustFail alice do
+    exerciseCmd (toInterfaceContractId @Observable cid) AddObserver
+      with newObserver = alice
+
+-- Test: Cannot remove non-existent observer
+testRemoveNonExistentObserver : Script ()
+testRemoveNonExistentObserver = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  
+  -- Alice creates contract with only Bob as observer
+  cid <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = [bob]
+  
+  -- Alice attempts to remove Charlie (not an observer) which should fail
+  submitMustFail alice do
+    exerciseCmd (toInterfaceContractId @Observable cid) RemoveObserver
+      with observerToRemove = charlie
+
+-- Test: Remove specific observer from multiple observers
+testRemoveSingleObserver : Script ()
+testRemoveSingleObserver = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  
+  -- Alice creates contract with Bob and Charlie as observers
+  cid <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = [bob, charlie]
+  
+  -- Alice removes Bob (Charlie should remain)
+  newCid <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @Observable cid) RemoveObserver
+      with observerToRemove = bob
+  
+  -- Verify only Charlie remains as observer
+  observers <- alice `submit` do
+    exerciseCmd newCid GetObservers with viewer = alice
+  
+  observers === [charlie]
+
+-- Test: GetObservers returns current observer list
+testGetObservers : Script ()
+testGetObservers = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  
+  -- Alice creates contract with multiple observers
+  cid <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = [bob, charlie]
+  
+  -- Verify GetObservers returns correct list
+  observers <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @Observable cid) GetObservers with viewer = alice
+  
+  length observers === 2
+  assert (bob `elem` observers)
+  assert (charlie `elem` observers)
+
+-- Test: Complete workflow - add multiple observers then remove them
+testCompleteObserverWorkflow : Script ()
+testCompleteObserverWorkflow = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  dave <- allocateParty "Dave"
+  
+  -- Start with empty observer list
+  cid1 <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = []
+  
+  -- Add first observer
+  cid2 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @Observable cid1) AddObserver
+      with newObserver = bob
+
+  -- Add second observer
+  cid3 <- alice `submit` do
+    exerciseCmd cid2 AddObserver
+      with newObserver = charlie
+
+  -- Add third observer
+  cid4 <- alice `submit` do
+    exerciseCmd cid3 AddObserver
+      with newObserver = dave
+  
+  -- Verify all observers are present
+  allObservers <- alice `submit` do
+    exerciseCmd cid4 GetObservers with viewer = alice
+  
+  length allObservers === 3
+  assert (bob `elem` allObservers)
+  assert (charlie `elem` allObservers)
+  assert (dave `elem` allObservers)
+  
+  -- Remove middle observer
+  cid5 <- alice `submit` do
+    exerciseCmd cid4 RemoveObserver
+      with observerToRemove = charlie
+  
+  -- Verify only Bob and Dave remain
+  remainingObservers <- alice `submit` do
+    exerciseCmd cid5 GetObservers with viewer = alice
+  
+  length remainingObservers === 2
+  assert (bob `elem` remainingObservers)
+  assert (dave `elem` remainingObservers)
+  assert (charlie `notElem` remainingObservers)
+
+-- Test: Remove all observers sequentially
+testRemoveAllObserversSequentially : Script ()
+testRemoveAllObserversSequentially = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  dave <- allocateParty "Dave"
+
+  -- Create contract with 3 observers
+  cid1 <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = [bob, charlie, dave]
+
+  -- Verify initial state
+  initialObservers <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @Observable cid1) GetObservers with viewer = alice
+
+  length initialObservers === 3
+
+  -- Remove first observer
+  cid2 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @Observable cid1) RemoveObserver
+      with observerToRemove = bob
+
+  observers2 <- alice `submit` do
+    exerciseCmd cid2 GetObservers with viewer = alice
+
+  length observers2 === 2
+  assert (bob `notElem` observers2)
+  assert (charlie `elem` observers2)
+  assert (dave `elem` observers2)
+
+  -- Remove second observer
+  cid3 <- alice `submit` do
+    exerciseCmd cid2 RemoveObserver
+      with observerToRemove = charlie
+
+  observers3 <- alice `submit` do
+    exerciseCmd cid3 GetObservers with viewer = alice
+
+  length observers3 === 1
+  assert (dave `elem` observers3)
+
+  -- Remove final observer
+  cid4 <- alice `submit` do
+    exerciseCmd cid3 RemoveObserver
+      with observerToRemove = dave
+
+  -- Verify empty list
+  finalObservers <- alice `submit` do
+    exerciseCmd cid4 GetObservers with viewer = alice
+
+  assert (null finalObservers)
+
+-- Test: Observer order is preserved across add/remove operations
+testObserverOrderPreservation : Script ()
+testObserverOrderPreservation = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  dave <- allocateParty "Dave"
+  eve <- allocateParty "Eve"
+
+  -- Start with empty observer list
+  cid1 <- alice `submit` do
+    createCmd TestObservableContract with
+      owner = alice
+      observableView = ObservableView with observers = []
+
+  -- Add observers in specific order: Bob, Charlie, Dave, Eve
+  cid2 <- alice `submit` do
+    exerciseCmd (toInterfaceContractId @Observable cid1) AddObserver
+      with newObserver = bob
+
+  cid3 <- alice `submit` do
+    exerciseCmd cid2 AddObserver
+      with newObserver = charlie
+
+  cid4 <- alice `submit` do
+    exerciseCmd cid3 AddObserver
+      with newObserver = dave
+
+  cid5 <- alice `submit` do
+    exerciseCmd cid4 AddObserver
+      with newObserver = eve
+
+  -- Verify order: [Bob, Charlie, Dave, Eve] (appended)
+  allObservers <- alice `submit` do
+    exerciseCmd cid5 GetObservers with viewer = alice
+
+  length allObservers === 4
+  allObservers === [bob, charlie, dave, eve]
+
+  -- Remove middle observer (Charlie)
+  cid6 <- alice `submit` do
+    exerciseCmd cid5 RemoveObserver
+      with observerToRemove = charlie
+
+  -- Verify order maintained: [Bob, Dave, Eve]
+  remainingObservers <- alice `submit` do
+    exerciseCmd cid6 GetObservers with viewer = alice
+
+  length remainingObservers === 3
+  remainingObservers === [bob, dave, eve]

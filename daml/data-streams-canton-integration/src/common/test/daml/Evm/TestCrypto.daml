@@ -1,0 +1,108 @@
+-- Tests for Ethereum signature validation
+module Evm.TestCrypto where
+
+import Daml.Script
+import DA.Crypto.Text (BytesHex, PublicKeyHex)
+import Evm.Crypto (validateSignature)
+
+
+-- Test data from fixtures/signed-payload.json (raw ECDSA signatures, no Ethereum prefix)
+testMessageHash : BytesHex
+testMessageHash = "5604887869a3031602eff0fec1b664b8f85ed14a9c87a512a6723d0b95bf3730"
+
+-- Signer 1 (index 0)
+signer1PublicKey : PublicKeyHex
+signer1PublicKey = "0493fd6c70d37ce9eb08a439c5f6d4dee63ea00e72de91d410340ac57588108f35b8cb924127cffb3ebc5fbc7dfa67947f5400726e39fe01bf41a95696bc178164"
+
+signer1R : BytesHex
+signer1R = "c58a082bfb0af349b672fc9411ebe1da6f077c56998a174c50cdf35619efc3aa"
+
+signer1S : BytesHex
+signer1S = "06a9fcc0c11e8d6eb28fd27619539257fae0025b3c64af4a1d65231e5c4413d4"
+
+-- Signer 2 (index 1)
+signer2PublicKey : PublicKeyHex
+signer2PublicKey = "0497c5bd3b562d252d2a7f50df14cfab01640d605e6cf849662048686cc672e83324b8875800a70b2845119ce2da311fc7c13431c1ca01b67f699840b6cbdb77a9"
+
+signer2R : BytesHex
+signer2R = "bff1262378d6af254b7b6fddeff0ad0ba55fd6fa276f0a83578d7e3c0e55a11b"
+
+signer2S : BytesHex
+signer2S = "078b99956952c784a8bd1eb7754d543dc908fe9b90533d362ce7d5d77a33ef4b"
+
+-- Signer 3 (index 2)
+signer3PublicKey : PublicKeyHex
+signer3PublicKey = "04c7f0dac3f45406d35d3227c84b458e237f39241b42ed46229bffdb54fc5f8f6f8695b534fe9bf5099d6afe579556f0810de20d882bc4ada75085d09a2fc30ba1"
+
+signer3R : BytesHex
+signer3R = "6252646db518d44be27cd937736942c804f91b28fc205a556b94dc8472a7b58c"
+
+signer3S : BytesHex
+signer3S = "73bb4b8064b6c1bf4880d3baff27c27d5d351f4fccb11c6cbba051a69488946b"
+
+-- Test: Validate signer 1 signature
+testValidateSigner1 : Script ()
+testValidateSigner1 = script do
+  let isValid = validateSignature testMessageHash signer1PublicKey signer1R signer1S
+  assertMsg "Signer 1 signature should be valid" isValid
+
+-- Test: Validate signer 2 signature
+testValidateSigner2 : Script ()
+testValidateSigner2 = script do
+  let isValid = validateSignature testMessageHash signer2PublicKey signer2R signer2S
+  assertMsg "Signer 2 signature should be valid" isValid
+
+-- Test: Validate signer 3 signature
+testValidateSigner3 : Script ()
+testValidateSigner3 = script do
+  let isValid = validateSignature testMessageHash signer3PublicKey signer3R signer3S
+  assertMsg "Signer 3 signature should be valid" isValid
+
+-- Test: Invalid signature (wrong r value)
+testInvalidSignatureWrongR : Script ()
+testInvalidSignatureWrongR = script do
+  let wrongR = "0000000000000000000000000000000000000000000000000000000000000001"
+  let isValid = validateSignature testMessageHash signer1PublicKey wrongR signer1S
+  assertMsg "Signature with wrong R should be invalid" (not isValid)
+
+-- Test: Invalid signature (wrong s value)
+testInvalidSignatureWrongS : Script ()
+testInvalidSignatureWrongS = script do
+  let wrongS = "0000000000000000000000000000000000000000000000000000000000000001"
+  let isValid = validateSignature testMessageHash signer1PublicKey signer1R wrongS
+  assertMsg "Signature with wrong S should be invalid" (not isValid)
+
+-- Test: Wrong public key
+testInvalidSignatureWrongPublicKey : Script ()
+testInvalidSignatureWrongPublicKey = script do
+  let isValid = validateSignature testMessageHash signer2PublicKey signer1R signer1S
+  assertMsg "Signature with wrong public key should be invalid" (not isValid)
+
+-- Test: Wrong message hash
+testInvalidSignatureWrongMessage : Script ()
+testInvalidSignatureWrongMessage = script do
+  let wrongHash = "0000000000000000000000000000000000000000000000000000000000000001"
+  let isValid = validateSignature wrongHash signer1PublicKey signer1R signer1S
+  assertMsg "Signature with wrong message hash should be invalid" (not isValid)
+
+-- Test: All-zeros signature components (r=0)
+testInvalidSignatureAllZerosR : Script ()
+testInvalidSignatureAllZerosR = script do
+  let zeroR = "0000000000000000000000000000000000000000000000000000000000000000"
+  let isValid = validateSignature testMessageHash signer1PublicKey zeroR signer1S
+  assertMsg "Signature with all-zeros R component should be invalid" (not isValid)
+
+-- Test: All-zeros signature components (s=0)
+testInvalidSignatureAllZerosS : Script ()
+testInvalidSignatureAllZerosS = script do
+  let zeroS = "0000000000000000000000000000000000000000000000000000000000000000"
+  let isValid = validateSignature testMessageHash signer1PublicKey signer1R zeroS
+  assertMsg "Signature with all-zeros S component should be invalid" (not isValid)
+
+-- Test: Both signature components zero
+testInvalidSignatureBothZeros : Script ()
+testInvalidSignatureBothZeros = script do
+  let zeroR = "0000000000000000000000000000000000000000000000000000000000000000"
+  let zeroS = "0000000000000000000000000000000000000000000000000000000000000000"
+  let isValid = validateSignature testMessageHash signer1PublicKey zeroR zeroS
+  assertMsg "Signature with both R and S as zeros should be invalid" (not isValid)

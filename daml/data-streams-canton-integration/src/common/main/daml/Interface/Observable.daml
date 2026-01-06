@@ -1,0 +1,56 @@
+module Interface.Observable where
+
+-- View type for the Observable interface
+data ObservableView = ObservableView
+  with
+    observers : [Party]
+  deriving (Eq, Show)
+
+-- Observable interface providing observer management pattern
+interface Observable where
+  viewtype ObservableView
+
+  -- Abstract method that implementing contracts must provide to update the view
+  updateObservable : ObservableView -> Update (ContractId Observable)
+
+  -- Add an observer to the contract (signatory-only)
+  choice AddObserver : ContractId Observable
+    with
+      newObserver : Party
+    controller signatory this
+    do
+      let observableView = view this
+
+      assertMsg "Observer already exists" (newObserver `notElem` observableView.observers)
+      assertMsg "Cannot add contract signatory as observer" (newObserver `notElem` signatory this)
+
+      -- Add the observer to the end of the existing view
+      let updatedObservableView = observableView with
+            observers = observableView.observers ++ [newObserver]
+
+      -- Update the view
+      updateObservable this updatedObservableView
+
+  -- Remove an observer from the contract (signatory-only)
+  choice RemoveObserver : ContractId Observable
+    with
+      observerToRemove : Party
+    controller signatory this
+    do
+      let observableView = view this
+
+      assertMsg "Observer does not exist" (observerToRemove `elem` observableView.observers)
+
+      -- Remove the observer from the existing view
+      let updatedObservableView = observableView with
+            observers = filter (/= observerToRemove) observableView.observers
+
+      -- Update the view
+      updateObservable this updatedObservableView
+
+  -- Get the list of observers for this contract
+  nonconsuming choice GetObservers : [Party]
+    with viewer : Party
+    controller viewer
+    do
+      return (view this).observers

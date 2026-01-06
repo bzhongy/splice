@@ -1,0 +1,103 @@
+module Verifier where
+
+import DA.Crypto.Text (BytesHex, keccak256)
+import DA.Map qualified as Map
+import DA.List (head, (!!))
+import VerifierConfig
+import Interface.TypeAndVersion
+import ReportParser
+import Evm.Crypto (validateSignature)
+import Util.Hex (stripHexPrefix)
+
+-- | Verifier contract for signature verification
+-- | Observers (users) can call Verify with their VerifierConfig
+template Verifier
+  with
+    owner : Party
+    observers : [Party]
+  where
+    signatory owner
+    observer observers
+
+    -- Implements the TypeAndVersion interface
+    interface instance TypeAndVersion for Verifier where
+      view = TypeAndVersionView with typeAndVersion = "Verifier:1.0.0"
+
+    -- Verify signed reports using config from VerifierConfig
+    -- Decodes the signed report payload and validates signatures
+    nonconsuming choice Verify : BytesHex
+      with
+        configCid : ContractId VerifierConfig  -- Observer's config ContractId
+        signedReportBytes : BytesHex           -- EVM-encoded signed report (hex)
+        sender : Party                          -- The party requesting verification
+      controller sender
+      do
+        -- Fetch VerifierConfig by ContractId
+        config <- fetch configCid
+
+        -- Strip 0x prefix from payload if present
+        let cleanPayload = stripHexPrefix signedReportBytes
+
+        -- Parse the signed report
+        let signedReport = parseSignedReport cleanPayload
+
+        -- Extract config digest from reportContext[0] (32 bytes)
+        let configDigest = head signedReport.reportContext
+
+        -- Lookup verifier state for this config digest
+        let verifierState = case Map.lookup configDigest config.verifierConfigStateView.verifierStates of
+              None -> error ("DigestNotSet: " <> configDigest)
+              Some state -> state
+
+        -- Validate the report
+        let expectedNumSignatures = verifierState.f + 1
+
+        -- Check if config is active
+        assertMsg ("DigestInactive: " <> configDigest) verifierState.isActive
+
+        -- Check correct number of signatures (f + 1)
+        let rsLength = length signedReport.rs
+        assertMsg ("IncorrectSignatureCount: " <> show rsLength <> " signatures, expected " <> show expectedNumSignatures)
+          (rsLength == expectedNumSignatures)
+
+        -- Check that rs and ss have matching lengths
+        let ssLength = length signedReport.ss
+        assertMsg ("MismatchedSignatures: rs length " <> show rsLength <> " != ss length " <> show ssLength)
+          (rsLength == ssLength)
+
+        let hashedReport = keccak256 signedReport.reportData
+        let reportContextConcatenated =
+              signedReport.reportContext !! 0 <>
+              signedReport.reportContext !! 1 <>
+              signedReport.reportContext !! 2
+        let h = keccak256 (hashedReport <> reportContextConcatenated)
+
+        -- Verify signatures and collect valid signers
+        let validSigners = foldl verifySignature Map.empty (zip signedReport.rs signedReport.ss)
+              where
+                verifySignature accMap (r, s) =
+                  let matchingOracle = findFirstValidOracle accMap r s
+                  in case matchingOracle of
+                       Some pk -> Map.insert pk () accMap
+                       None -> error "BadVerification: signature did not match any oracle"
+
+                findFirstValidOracle accMap r s =
+                  foldl checkOracle None (Map.toList verifierState.oracles)
+                  where
+                    checkOracle foundKey (publicKey, _index) =
+                      case foundKey of
+                        Some _ -> foundKey  -- Already found, skip remaining keys
+                        None ->
+                          -- Only check if this oracle hasn't signed yet (no duplicates)
+                          if Map.member publicKey accMap
+                          then None
+                          else
+                            -- Validate signature
+                            if validateSignature h publicKey r s
+                            then Some publicKey
+                            else None
+
+        assertMsg "BadVerification: insufficient unique signers"
+          (Map.size validSigners == expectedNumSignatures)
+
+        return signedReport.reportData
