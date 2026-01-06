@@ -1,3 +1,6 @@
 [submodule ".github/runners/runner-container-hooks"]
 	path = .github/runners/runner-container-hooks
 	url = ../../hyperledger-labs/splice-runner-container-hooks.git
+[submodule "daml/data-streams-canton-integration"]
+	path = daml/data-streams-canton-integration
+	url = https://github.com/smartcontractkit/data-streams-canton-integration.git
